@@ -1,0 +1,15 @@
+name: proteinae_r1_d8
+
+defaults:
+  - _self_
+  - ae: ae_r1_d8
+
+target_pred: v
+
+augmentation:
+  global_rotation: true  # Whether to augment samples with random rotation
+  naug_rot: 1  # How many augmentations to apply per sample (batch size increases by this factor...)
+
+ca_only: false
+apply_inv_folding: false
+latent_add_place: cond
