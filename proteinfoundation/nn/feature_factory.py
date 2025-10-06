@@ -177,7 +177,7 @@ class FoldEmbeddingSeqFeat(Feature):
         """Create cath label vocabulary for C, A, T levels."""
         mapping_file = os.path.join(cath_code_dir, "cath_label_mapping.pt")
         if os.path.exists(mapping_file):
-            class_mapping = torch.load(mapping_file)
+            class_mapping = torch.load(mapping_file, weights_only=False)
         else:
             raise IOError(f"{mapping_file} does not exist...")
 

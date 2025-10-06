@@ -1230,7 +1230,7 @@ class ProteinLatentTransformer(torch.nn.Module):
         self.nheads = kwargs["nheads"]
         self.use_qkln = kwargs["use_qkln"]
         self.apply_rotary = kwargs["apply_rotary"]
-        self.vae_token_dim = kwargs["vae_token_dim"]
+        self.ae_token_dim = kwargs["ae_token_dim"]
         self.use_attn_pair_bias = kwargs["use_attn_pair_bias"]
         
         # Registers
@@ -1250,7 +1250,7 @@ class ProteinLatentTransformer(torch.nn.Module):
             dim_feats_out=kwargs["token_dim"],
             use_ln_out=False,
             mode="seq",
-            dim_latent=self.vae_token_dim,
+            dim_latent=self.ae_token_dim,
             **kwargs,
         )
         
@@ -1279,8 +1279,8 @@ class ProteinLatentTransformer(torch.nn.Module):
             # If no pair bias no point in having a pair representation
             self.update_pair_repr = False
         
-        self.linear_xt = torch.nn.Linear(self.vae_token_dim, self.token_dim, bias=False)
-        self.linear_out = torch.nn.Linear(self.token_dim, self.vae_token_dim, bias=False)
+        self.linear_xt = torch.nn.Linear(self.ae_token_dim, self.token_dim, bias=False)
+        self.linear_out = torch.nn.Linear(self.token_dim, self.ae_token_dim, bias=False)
             
         # Trunk layers
         self.transformer_layers = torch.nn.ModuleList(

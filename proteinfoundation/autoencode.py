@@ -477,20 +477,6 @@ def main():
             mode=args.mode,
             chains=args.chains
         )
-    # try:
-    #     process_protein(
-    #         autoencoder=autoencoder,
-    #         pdb_path=pdb_path,
-    #         output_dir=output_dir / pdb_path.stem,
-    #         cfg=cfg,
-    #         mode=args.mode,
-    #         chains=args.chains
-    #     )
-    #     logger.info("Processing completed successfully!")
-        
-    # except Exception as e:
-    #     logger.error(f"Error during processing: {str(e)}")
-    #     sys.exit(1)
 
 
 if __name__ == "__main__":

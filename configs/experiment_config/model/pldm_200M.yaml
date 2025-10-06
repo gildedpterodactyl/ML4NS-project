@@ -1,0 +1,24 @@
+name: pldm_200M_512
+
+defaults:
+  - _self_
+  - ldm: pldm_r1_d8_200M
+
+target_pred: v
+
+augmentation:
+  global_rotation: true  # Whether to augment samples with random rotation
+  naug_rot: 1  # How many augmentations to apply per sample (batch size increases by this factor...)
+
+ca_only: false
+pretrained_weights: "checkpoints/ae_r1_d8_512.ckpt"
+
+# The ODE to sample flow matching is given by [dx_t = v(x_t, t) dt].
+# The SDE [dx_t = v(x_t, t) dt + g_t * s(x_t, t) dt + \sqrt(2 g_t) dw_t]
+# produces the same marginal distributions for any g_t.
+# The parameters from above are:
+#   - sampling_mode: vf or sc, corresponding to ODE or SDE
+#   - sc_scale_noise: Changes the noise term in the SDE as \sqrt(2 g_t) -> \sqrt(2 g_t * sc_scale_noise)
+#   - sc_scale_score: Changes the score term in the SDE as g_t * s(x_t, t) -> g_t * s(x_t, t) * sc_scale_score
+#   - sc_g: Sets the g_t. Specifically, we have g_t = sc_g * min(5, (1-t)/t), where the t dependency comes
+#   from the optimal transport coupling.
