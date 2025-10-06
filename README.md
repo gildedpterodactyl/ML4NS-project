@@ -25,3 +25,13 @@ python proteinfoundation/autoencode.py \
 python proteinfoundation/train_ae.py \
     --config_name training_ae_r1_d8
 ```
+
+
+## LDM
+
+### Training
+
+```bash
+python proteinfoundation/train_ldm.py \
+    --config_name training_pldm_200M_afdb_512
+```
