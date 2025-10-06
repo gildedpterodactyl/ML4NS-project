@@ -490,13 +490,6 @@ class ModelTrainerBase(L.LightningModule):
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
         )
-        if mask is None:
-            mask = torch.ones(nsamples, n).long().bool().to(self.device)
-        if coords_mask is None:
-            if not self.ca_only:
-                coords_mask = repeat(mask, "b n -> b (n c)", c=4)
-            else:
-                coords_mask = mask
         return self.fm.full_simulation(
             predict_clean_n_v_w_guidance,
             dt=dt,

@@ -1,0 +1,20 @@
+defaults:
+  - _self_
+
+run_name_: inference_proteinae
+
+ckpt_name: ae_r1_d8.ckpt
+
+self_cond: True
+dt: 0.05
+
+# Sampling params only for CAFlow
+sampling_bbflow:
+  sampling_mode: vf  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
+  gt_mode: "1/t"  # us, tan, or 1/t
+  gt_p: 1.0  # float
+  gt_clamp_val: null  # 10.0 float or null
+
+ca_only: True
+ae_mode: autoencode
+inv_folding: False

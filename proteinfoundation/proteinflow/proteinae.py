@@ -64,11 +64,16 @@ class ProteinAE(ModelTrainerBase):
         # Define flow matcher
        
         self.ca_only = cfg_exp.model.ca_only
-        self.fm = R3NFlowMatcher(zero_com=True, scale_ref=1.0)  # Work in nm
+        self.dim_latent = cfg_exp.model.ae.encoder.dim_latent
+        self.fm = R3NFlowMatcher(
+            zero_com=True,
+            scale_ref=1.0,
+            dim=3
+        )  # Work in nm
         self.fm_z = R3NFlowMatcher(
             zero_com=False,
             scale_ref=1.0,
-            dim=cfg_exp.model.ae.encoder.dim_latent
+            dim=self.dim_latent
         )  # Work in latent space
         # Cache frequently used config values
         self.zaug_p = cfg_exp.training.get("zaug_p", 0.1)
@@ -152,7 +157,8 @@ class ProteinAE(ModelTrainerBase):
                 + (1 - autoguidance_ratio) * x_pred_uncond
             )
 
-        return x_pred
+        v = self.fm.xt_dot(x_pred, batch["x_t"], batch["t"], batch["coords_mask"])
+        return x_pred, v
 
     def extract_clean_sample(self, batch):
         """
@@ -606,7 +612,7 @@ class ProteinAE(ModelTrainerBase):
         
         x = self.generate(
             nsamples=batch["nsamples"],
-            n=batch["nres"] if not self.ca_only else batch["nres"] * 4,
+            n=batch["nres"] if self.ca_only else batch["nres"] * 4,
             dt=batch["dt"],
             self_cond=self.inf_cfg.self_cond,
             cath_code=cath_code,
