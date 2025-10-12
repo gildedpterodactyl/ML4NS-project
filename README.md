@@ -37,6 +37,14 @@ python proteinfoundation/train_ldm.py \
     --config_name training_pldm_200M_afdb_512
 ```
 
+### Inference
+
+```bash
+python proteinfoundation/inference_ldm.py \
+    --config_name inference_ucond_pldm_200M_512 \
+    --ckpt_name pldm_200M.ckpt
+```
+
 ### TODO List:
 - [ ] Add ProteinAE checkpoint
 - [ ] Add ProteinLDM checkpoint

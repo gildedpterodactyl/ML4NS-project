@@ -608,7 +608,7 @@ class ProteinAE(ModelTrainerBase):
         # Generate samples
         batch["dt"] = torch.scalar_tensor(dt, dtype=single_repr.dtype)
         mask = batch.get("mask", torch.ones(1, batch["nres"], dtype=torch.bool, device=self.device))
-        coords_mask = batch.get("coords_mask", repeat(mask, "b n -> b (n c)", c=4))
+        coords_mask = batch.get("coords_mask", repeat(mask, "b n -> b (n c)", c=4 if not self.ca_only else 1))
         
         x = self.generate(
             nsamples=batch["nsamples"],

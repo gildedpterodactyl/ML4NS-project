@@ -1,0 +1,43 @@
+defaults:
+  - inference_base
+  - model: pldm_200M
+  - _self_
+
+run_name_: ucond_pldm_200M_512
+ckpt_name: null
+seed: 42
+
+nres_lens: [200]
+nsamples_per_len: 5
+max_nsamples: 256
+
+dt_latent: 0.0025
+sampling_latent_flow:
+  sampling_mode: sc  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
+  sc_scale_noise: 0.35  # scale used to multiply noise if mode == sc
+  sc_scale_score: 1.0  # scale used to multiply score if mode == sc, not implemented yet
+  gt_mode: "1/t"  # us, tan, or 1/t
+  gt_p: 1.0  # float
+  gt_clamp_val: null  # 10.0 float or null
+self_cond: True
+
+training:
+  self_cond: True
+  fold_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob
+
+dt: 0.05
+# Sampling params only for BBFlow
+sampling_bbflow:
+  sampling_mode: vf  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
+  gt_mode: "1/t"  # us, tan, or 1/t
+  gt_p: 1.0  # float
+  gt_clamp_val: null  # 10.0 float or null
+
+ca_only: False
+num_seq_per_target: 8
+compute_designability: False
+

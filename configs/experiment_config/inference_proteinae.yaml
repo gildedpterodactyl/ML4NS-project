@@ -8,7 +8,6 @@ ckpt_name: ae_r1_d8.ckpt
 self_cond: True
 dt: 0.05
 
-# Sampling params only for CAFlow
 sampling_bbflow:
   sampling_mode: vf  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
   gt_mode: "1/t"  # us, tan, or 1/t

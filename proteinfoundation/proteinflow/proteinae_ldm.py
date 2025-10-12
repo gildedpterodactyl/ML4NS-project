@@ -69,7 +69,7 @@ class ProteinLDM(ModelTrainerBase):
 
         # Define flow matcher
        
-        self.ca_only = cfg_exp.model.ca_only
+        self.ca_only: bool = cfg_exp.model.ca_only
         self.ae_token_dim = cfg_exp.model.ldm.encoder.get(
             "dim_latent",
             cfg_exp.model.ldm.encoder.token_dim  # No channel bottleneck
@@ -150,21 +150,58 @@ class ProteinLDM(ModelTrainerBase):
             sum(p.numel() for p in self.decoder.parameters() if p.requires_grad) +
             sum(p.numel() for p in self.ldm.parameters() if p.requires_grad)
         )
+    
+    def predict_clean(self, batch: Dict):
+        nn_out = self.decoder(batch)  # [*, n, 3]
+        return (
+            self._nn_out_to_x_clean(nn_out, batch),
+            nn_out,  # [*, n, 3]
+        )
+
+    def predict_clean_n_v_w_guidance(
+        self,
+        batch: Dict,
+        guidance_weight: float = 1.0,
+        autoguidance_ratio: float = 0.0,
+    ):
+        if self.motif_conditioning and \
+        (
+            "fixed_structure_mask" not in batch \
+                or "x_motif" not in batch
+        ):
+            batch.update(self.motif_factory(batch, zeroes = True))
+
+        nn_out = self.decoder(batch)
+        x_pred = self._nn_out_to_x_clean(nn_out, batch)
+
+        if guidance_weight != 1.0:
+            assert autoguidance_ratio >= 0.0 and autoguidance_ratio <= 1.0
+            if autoguidance_ratio > 0.0:  # Use auto-guidance
+                nn_out_ag = self.nn_ag(batch)
+                x_pred_ag = self._nn_out_to_x_clean(nn_out_ag, batch)
+            else:
+                x_pred_ag = torch.zeros_like(x_pred)
+
+            if autoguidance_ratio < 1.0:  # Use CFG
+                assert (
+                    "cath_code" in batch
+                ), "Only support CFG when cath_code is provided"
+                uncond_batch = batch.copy()
+                uncond_batch.pop("cath_code")
+                nn_out_uncond = self.decoder(uncond_batch)
+                x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch)
+            else:
+                x_pred_uncond = torch.zeros_like(x_pred)
+
+            x_pred = guidance_weight * x_pred + (1 - guidance_weight) * (
+                autoguidance_ratio * x_pred_ag
+                + (1 - autoguidance_ratio) * x_pred_uncond
+            )
+
+        v = self.fm.xt_dot(x_pred, batch["x_t"], batch["t"], batch["coords_mask"])
+        return x_pred, v
         
     def _nn_out_to_x_clean_latent(self, nn_out, batch):
-        """
-        Transforms the output of the nn to a clean sample prediction. The transformation depends on the
-        parameterization used. For now we admit x_1 or v.
-
-        Args:
-            nn_out: Dictionary, nerual network output
-                - "coords_pred": Tensor of shape [b, n, 3], could be the clean sample or the velocity
-                - "pair_pred" (Optional): Tensor of shape [b, n, n, num_buckets_predict_pair], could be the clean sample or the velocity
-            batch: Dictionary, batch of data
-
-        Returns:
-            Clean sample prediction, tensor of shape [b, n, 3].
-        """
         nn_pred = nn_out["single_repr_pred"]
         t = batch["t"]  # [*]
         t_ext = t[..., None, None]  # [*, 1, 1]
@@ -183,24 +220,6 @@ class ProteinLDM(ModelTrainerBase):
         self,
         batch: Dict,
     ):
-        """
-        Predicts clean samples given noisy ones and time.
-
-        Args:
-            batch: a batch of data with some additions, including
-                - "x_t": Type depends on the mode (see beluw, "returns" part)
-                - "t": Time, shape [*]
-                - "mask": Binary mask of shape [*, n]
-                - "x_sc" (optional): Prediction for self-conditioning
-                - Other features from the dataloader.
-
-        Returns:
-            Predicted clean sample, depends on the "modality" we're in.
-                - For frameflow it returns a dictionary with keys "trans" and "rot", and values
-                tensors of shape [*, n, 3] and [*, n, 3, 3] respectively,
-                - For CAflow it returns a tensor of shape [*, n, 3].
-            Other things predicted by nn (pair_pred for distogram loss)
-        """
         nn_out = self.ldm(batch)
         # nn_out = self.latent(x=batch["x_t"], t=batch["t"], y=None)  # [*, n, 3]
         return self._nn_out_to_x_clean_latent(nn_out, batch), nn_out  # [*, n, 3]
@@ -671,10 +690,6 @@ class ProteinLDM(ModelTrainerBase):
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
         )
-        if mask is None:
-            mask = torch.ones(nsamples, n).long().bool().to(self.device)
-        if coords_mask is None:
-            coords_mask = mask.clone()
         return self.fm_latent.full_simulation(
             predict_clean_n_v_w_guidance_latent,
             dt=dt,
@@ -719,7 +734,14 @@ class ProteinLDM(ModelTrainerBase):
         guidance_weight = self.inf_cfg.get("guidance_weight", 1.0)
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
         
-        mask = batch['mask'].squeeze(0) if 'mask' in batch else None
+        mask = batch.get(
+            "mask",
+            torch.ones(
+                batch["nsamples"], batch["nres"],
+                dtype=torch.bool,
+                device=self.device
+            )
+        )
         if 'motif_seq_mask' in batch:
             fixed_sequence_mask = batch['motif_seq_mask'].squeeze(0).to(self.device)
             x_motif = batch['motif_structure'].squeeze(0).to(self.device)
@@ -767,16 +789,21 @@ class ProteinLDM(ModelTrainerBase):
             gt_p=sampling_args_latent["gt_p"],
             gt_clamp_val=sampling_args_latent["gt_clamp_val"],
             mask=mask,
+            coords_mask=mask,
             x_motif=x_motif,
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
         )
         
         sampling_args = self.inf_cfg.sampling_bbflow
+        coords_mask = batch.get(
+            "coords_mask",
+            repeat(mask, "b n -> b (n c)", c=4 if not self.ca_only else 1)
+        )
         
         x = self.generate(
             nsamples=batch["nsamples"],
-            n=batch["nres"],
+            n=batch["nres"] if self.ca_only else batch["nres"] * 4,
             dt=batch["dt"].to(dtype=torch.float32),
             self_cond=self.inf_cfg.self_cond,
             cath_code=cath_code,
@@ -792,6 +819,7 @@ class ProteinLDM(ModelTrainerBase):
             gt_p=sampling_args["gt_p"],
             gt_clamp_val=sampling_args["gt_clamp_val"],
             mask=mask,
+            coords_mask=coords_mask,
             x_motif=x_motif,
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
