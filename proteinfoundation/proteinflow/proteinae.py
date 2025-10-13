@@ -78,9 +78,9 @@ class ProteinAE(ModelTrainerBase):
         # Cache frequently used config values
         self.zaug_p = cfg_exp.training.get("zaug_p", 0.1)
         self.use_inv_folding_loss = cfg_exp.loss.get("use_inv_folding_loss", False) and \
-            cfg_exp.model.ae.get("apply_inv_folding", False)
+            cfg_exp.model.get("apply_inv_folding", False)
         self.z_noise_scale = cfg_exp.training.get("z_noise_scale", 0.0)
-        self.latent_add_place = cfg_exp.model.ae.get("latent_add_place", "cond")
+        self.latent_add_place = cfg_exp.model.get("latent_add_place", "cond")
         self.self_cond = cfg_exp.training.get("self_cond", False)
 
         # Neural network
