@@ -64,20 +64,20 @@ class ProteinAE(ModelTrainerBase):
         # Define flow matcher
        
         self.ca_only = cfg_exp.model.ca_only
-        self.dim_latent = cfg_exp.model.ae.encoder.dim_latent
+        # self.dim_latent = cfg_exp.model.ae.encoder.dim_latent
         self.fm = R3NFlowMatcher(
             zero_com=True,
             scale_ref=1.0,
             dim=3
         )  # Work in nm
-        self.fm_z = R3NFlowMatcher(
-            zero_com=False,
-            scale_ref=1.0,
-            dim=self.dim_latent
-        )  # Work in latent space
+        # self.fm_z = R3NFlowMatcher(
+        #     zero_com=False,
+        #     scale_ref=1.0,
+        #     dim=self.dim_latent
+        # )  # Work in latent space
         # Cache frequently used config values
-        self.zaug_p = cfg_exp.training.get("zaug_p", 0.1)
-        self.use_inv_folding_loss = cfg_exp.loss.get("use_inv_folding_loss", False) and \
+        self.noise_tau = cfg_exp.training.get("noise_tau", 0.8)
+        self.apply_inv_folding = cfg_exp.loss.get("use_inv_folding_loss", False) and \
             cfg_exp.model.get("apply_inv_folding", False)
         self.z_noise_scale = cfg_exp.training.get("z_noise_scale", 0.0)
         self.latent_add_place = cfg_exp.model.get("latent_add_place", "cond")
@@ -87,12 +87,12 @@ class ProteinAE(ModelTrainerBase):
         self.encoder = ProteinTransformerAF3(
             **cfg_exp.model.ae.encoder,
             ca_only=self.ca_only,
-            apply_inv_folding=self.use_inv_folding_loss
+            apply_inv_folding=self.apply_inv_folding
         )
         self.decoder = ProteinTransformerAF3(
             **cfg_exp.model.ae.decoder,
             ca_only=self.ca_only,
-            apply_inv_folding=self.use_inv_folding_loss,
+            apply_inv_folding=self.apply_inv_folding,
             latent_add_place=self.latent_add_place
         )
 
@@ -339,8 +339,13 @@ class ProteinAE(ModelTrainerBase):
             single_repr,
             device=single_repr.device,
         )
+        noise_sigma = self.noise_tau \
+            * torch.rand(
+                (single_repr.size(0),) + (1,) * (len(single_repr.shape) - 1), 
+                device=single_repr.device
+            )
         single_repr = single_repr + \
-            single_rep_noise * self.z_noise_scale
+            single_rep_noise * noise_sigma
         batch["single_repr"] = single_repr
 
     def _apply_self_conditioning(self, batch):
@@ -363,9 +368,9 @@ class ProteinAE(ModelTrainerBase):
         train_loss = torch.mean(fm_loss)
         
         # Inverse folding loss
-        if self.use_inv_folding_loss:
+        if self.apply_inv_folding:
             inv_folding_loss = self.compute_inv_folding_loss(
-                batch["residue_type"], nn_out["residue_type_logits"], log_prefix=log_prefix
+                batch["residue_type"], nn_out["residue_type_logits"], mask, log_prefix=log_prefix
             )
             train_loss = train_loss + inv_folding_loss
             
@@ -491,21 +496,37 @@ class ProteinAE(ModelTrainerBase):
         self,
         gt_residue_type: Float[Tensor, "* n"],
         pred_residue_type_logits: Float[Tensor, "* n c"],
+        mask: Bool[Tensor, "* n"],
         ignore_index: int = -1,
         log_prefix: str = "",
     ) -> Float[Tensor, "*"]:
         """
         Computes inverse folding loss.
+        
+        Args:
+            gt_residue_type: Ground truth residue types, shape [*, n].
+            pred_residue_type_logits: Predicted residue type logits, shape [*, n, c].
+            mask: Boolean mask for valid residues, shape [*, n].
+            ignore_index: Index to ignore in loss computation.
+            log_prefix: Prefix for logging.
+            
+        Returns:
+            Inverse folding loss.
         """
         bs = gt_residue_type.shape[0]
         pred_residue_type_logits = rearrange(
             pred_residue_type_logits,
             "b n c -> b c n",
         )
+        
+        # Apply mask to ground truth residue types
+        masked_gt_residue_type = gt_residue_type.clone()
+        masked_gt_residue_type[~mask] = ignore_index
+        
         # cross entropy loss
         loss = F.cross_entropy(
             pred_residue_type_logits,
-            gt_residue_type.long(),
+            masked_gt_residue_type.long(),
             ignore_index=ignore_index,
         )
         self._log_metric(f"{log_prefix}/inv_folding_loss", torch.mean(loss), bs)
@@ -602,6 +623,25 @@ class ProteinAE(ModelTrainerBase):
             })
             
             x_1 = None  # No ground truth for decode mode
+
+        elif ae_mode == "encode":
+            
+            # Extract and encode input
+            x_1, mask, coords_mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
+            x_1 = self.fm._mask_and_zero_com(x_1, coords_mask)
+
+            batch.update({
+                "x_1": x_1,
+                "mask": mask,
+                "coords_mask": coords_mask,
+            })
+            
+            single_repr = self.encoder(batch).get("single_repr", None)
+            return {
+                "id": batch.get("id", None),
+                "single_repr": single_repr,
+            }
+
         else:
             raise ValueError(f"Sampling mode {ae_mode} not supported")
         

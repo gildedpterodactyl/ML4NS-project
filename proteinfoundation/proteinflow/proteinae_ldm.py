@@ -16,6 +16,7 @@ import random
 from functools import partial
 import math
 
+from loguru import logger
 import torch
 from jaxtyping import Bool, Float
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
@@ -75,7 +76,10 @@ class ProteinLDM(ModelTrainerBase):
             cfg_exp.model.ldm.encoder.token_dim  # No channel bottleneck
         )
         self.motif_conditioning = cfg_exp.training.get("motif_conditioning", False)
-        self.fm = R3NFlowMatcher(zero_com= not self.motif_conditioning, scale_ref=1.0)  # Work in nm
+        self.fm = R3NFlowMatcher(
+            zero_com= not self.motif_conditioning,
+            scale_ref=1.0
+        )  # Work in nm
         self.fm_latent = R3NFlowMatcher(
             zero_com=False,
             scale_ref=1.0,
@@ -94,18 +98,26 @@ class ProteinLDM(ModelTrainerBase):
             if "motif_x1_pair_dists" not in cfg_exp.model.nn.feats_pair_repr:
                 cfg_exp.model.nn.feats_pair_repr.append("motif_x1_pair_dists")
             self.motif_factory = SingleMotifFactory(motif_prob=cfg_exp.training.get("motif_prob", 1.0))
+        self.apply_inv_folding = cfg_exp.model.get("apply_inv_folding", False)
+        self.latent_add_place = cfg_exp.model.get("latent_add_place", "cond")
+        self.self_cond = cfg_exp.training.get("self_cond", False)
+        self.plddt_threshold = cfg_exp.training.get("plddt_threshold", 1.e-3)
 
         # Neural network
         self.encoder = ProteinTransformerAF3(
             **cfg_exp.model.ldm.encoder,
-            ca_only=self.ca_only
+            ca_only=self.ca_only,
+            apply_inv_folding=self.apply_inv_folding
         )
         # Align with original model
         self.decoder = ProteinTransformerAF3(
             **cfg_exp.model.ldm.decoder,
             ca_only=self.ca_only,
+            apply_inv_folding=self.apply_inv_folding,
+            latent_add_place=self.latent_add_place
         )
         self.ldm = ProteinLatentTransformer(**cfg_exp.model.ldm.latent, ae_token_dim=self.ae_token_dim)
+        self.time_dist_shift = cfg_exp.training.get("time_dist_shift", 12.0)
         
         # Calculate parameters
         self.nparams = self._calculate_model_parameters()
@@ -125,14 +137,14 @@ class ProteinLDM(ModelTrainerBase):
             for k, v in state_dict.items() 
             if k.startswith("encoder.")
         }
-        nn_state_dict = {
+        decoder_state_dict = {
             k[len("decoder."):]: v 
             for k, v in state_dict.items() 
             if k.startswith("decoder.")
         }
         
         self.encoder.load_state_dict(encoder_state_dict)
-        self.decoder.load_state_dict(nn_state_dict)
+        self.decoder.load_state_dict(decoder_state_dict)
         
         # Set models to evaluation mode and freeze parameters
         self.encoder.eval()
@@ -329,7 +341,9 @@ class ProteinLDM(ModelTrainerBase):
         """Extract CA-only coordinates and masks."""
         x_1 = batch["coords"][:, :, 1, :]  # [b, n, 3]
         coords_mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        plddt = batch["bfactor"]
         mask = coords_mask
+        mask = mask & (plddt > self.plddt_threshold)
         return x_1, mask, coords_mask
 
     def _extract_backbone_coordinates(self, batch):
@@ -340,6 +354,9 @@ class ProteinLDM(ModelTrainerBase):
         x_1 = rearrange(x_1, "b n c d -> b (n c) d")  # [b, 4*n, 3]
         coords_mask = batch["mask_dict"]["coords"][..., BB_INDEX, 0]  # [b, n, 4] boolean
         mask = coords_mask[..., 1]  # Use CA mask
+        plddt = batch["bfactor"]
+        mask = mask & (plddt > self.plddt_threshold)
+        coords_mask = coords_mask & (mask[..., None])
         coords_mask = rearrange(coords_mask, "b n c -> b (n c)")  # [b, 4*n]
         return x_1, mask, coords_mask
 
@@ -383,6 +400,38 @@ class ProteinLDM(ModelTrainerBase):
         )  # [naug * b, 3, 3]
         x_rot = torch.matmul(x, rots)
         return self.fm_latent._mask_and_zero_com(x_rot, mask), mask
+
+    def sample_t(self, shape):
+        if self.cfg_exp.loss.t_distribution.name == "uniform":
+            t_max = self.cfg_exp.loss.t_distribution.p2
+            t = torch.rand(shape, device=self.device) * t_max  # [*]
+        elif self.cfg_exp.loss.t_distribution.name == "logit-normal":
+            mean = self.cfg_exp.loss.t_distribution.p1
+            std = self.cfg_exp.loss.t_distribution.p2
+            noise = torch.randn(shape, device=self.device) * std + mean  # [*]
+            t = torch.nn.functional.sigmoid(noise)  # [*]
+        elif self.cfg_exp.loss.t_distribution.name == "beta":
+            p1 = self.cfg_exp.loss.t_distribution.p1
+            p2 = self.cfg_exp.loss.t_distribution.p2
+            dist = torch.distributions.beta.Beta(p1, p2)
+            t = dist.sample(shape).to(self.device)
+        elif self.cfg_exp.loss.t_distribution.name == "mix_up02_beta":
+            p1 = self.cfg_exp.loss.t_distribution.p1
+            p2 = self.cfg_exp.loss.t_distribution.p2
+            dist = torch.distributions.beta.Beta(p1, p2)
+            samples_beta = dist.sample(shape).to(self.device)
+            samples_uniform = torch.rand(shape, device=self.device)
+            u = torch.rand(shape, device=self.device)
+            t = torch.where(u < 0.02, samples_uniform, samples_beta)
+        else:
+            raise NotImplementedError(
+                f"Sampling mode for t {self.cfg_exp.loss.t_distribution.name} not implemented"
+            )
+
+        # ! In Proteina, t=1 -> x_1. But in RAE, t=1 -> x_0. So we need to invert the time distribution shift.
+        # t = self.time_dist_shift * t / (1 + (self.time_dist_shift - 1) * t)
+        t = t / (self.time_dist_shift - t * (self.time_dist_shift - 1))
+        return t
     
     def training_step(self, batch, batch_idx):
         """
@@ -794,6 +843,11 @@ class ProteinLDM(ModelTrainerBase):
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
         )
+
+        # Predict residue types if needed
+        pred_residue_type = None
+        if self.inf_cfg.inv_folding:
+            pred_residue_type = self.decoder.decode_residue_type(single_repr)
         
         sampling_args = self.inf_cfg.sampling_bbflow
         coords_mask = batch.get(
@@ -810,8 +864,8 @@ class ProteinLDM(ModelTrainerBase):
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
             dtype=torch.float32,
-            schedule_mode=self.inf_cfg.schedule.schedule_mode,
-            schedule_p=self.inf_cfg.schedule.schedule_p,
+            schedule_mode=self.inf_cfg.schedule_ldm.schedule_mode,
+            schedule_p=self.inf_cfg.schedule_ldm.schedule_p,
             sampling_mode=sampling_args["sampling_mode"],
             sc_scale_noise=sampling_args["sc_scale_noise"],
             sc_scale_score=sampling_args["sc_scale_score"],
@@ -830,4 +884,5 @@ class ProteinLDM(ModelTrainerBase):
             "id": batch.get("id", None),
             "pred_coords": self.samples_to_atom37(x),  # [b, n, 37, 3]
             "single_repr": single_repr,
+            "pred_residue_type": pred_residue_type,
         }

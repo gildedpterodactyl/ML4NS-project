@@ -29,9 +29,9 @@ from dotenv import load_dotenv
 from loguru import logger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
+from openfold.np import residue_constants
+
 from proteinfoundation.utils.lora_utils import replace_lora_layers
-
-
 from proteinfoundation.metrics.designability import scRMSD
 from proteinfoundation.metrics.metric_factory import (
     GenerationMetricFactory,
@@ -249,7 +249,7 @@ if __name__ == "__main__":
         else:
             config_name = args.config_name
         cfg = hydra.compose(config_name=config_name)
-        logger.info(f"Inference config {cfg}")
+        # logger.info(f"Inference config {cfg}")
         run_name = cfg.run_name_
         cfg.ckpt_name = args.ckpt_name
 
@@ -273,8 +273,6 @@ if __name__ == "__main__":
     if not cfg.lora.use:
         model = ProteinLDM(cfg)
         ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-        # remove encoder and nn from ckpt
-        # ckpt["state_dict"] = {k: v for k, v in ckpt["state_dict"].items() if not k.startswith("encoder.") and not k.startswith("nn.")}
         model.load_state_dict(ckpt["state_dict"])
     
     else: # If using lora, create lora layers and reload the state_dict
@@ -388,6 +386,15 @@ if __name__ == "__main__":
                 no_indexing=True,
             )
             # torch.save(pred["single_repr"][i].cpu(), os.path.join(sample_root_path, "latent_repr.pt"))
+            if cfg.inv_folding:
+                # write fasta
+                fa_name = dir_name + ".fa"
+                fa_string = pred["pred_residue_type"][i].cpu()
+                restypes = residue_constants.restypes + ["X"]
+                fa_string = ''.join([restypes[r.item()] for r in fa_string])
+                fa_path = os.path.join(sample_root_path, fa_name)
+                with open(fa_path, 'w') as f:
+                    f.write(f">{dir_name}\n{fa_string}")
 
             res_row = list(filtered_dict.values()) + [i, pdb_path, n]
 

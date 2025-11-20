@@ -651,10 +651,6 @@ class PDBLightningDataModule(BaseLightningDataModule):
             ]
 
         file_names = []
-        # for tuple_ in tqdm(index_pdb_tuples, desc="Processing structures", unit="file"):
-        #     result = self._load_and_process_pdb(tuple_)
-        #     if result is not None:
-        #         file_names.append(result)
         with mp.Pool(self.num_workers) as pool:
             result = pool.map(self._load_and_process_pdb, index_pdb_tuples)
         for r in result:

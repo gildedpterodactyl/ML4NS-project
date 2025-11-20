@@ -1001,12 +1001,13 @@ class ProteinTransformerAF3(torch.nn.Module):
                     pair_repr_dim=kwargs["pair_repr_dim"],
                 )
             
-            if self.apply_inv_folding:
-                self.residue_type_logits_head = torch.nn.Sequential(
-                    torch.nn.Linear(self.dim_latent, self.dim_latent * 4),
-                    torch.nn.ReLU(),
-                    torch.nn.Dropout(),
-                    torch.nn.Linear(self.dim_latent * 4, kwargs.get("num_residue_types", 21)),
+        if self.apply_inv_folding:
+            if self.module_type == "encoder":
+                self.encode_residue_type = torch.nn.Linear(22, kwargs["dim_cond"], bias=False)
+            if self.module_type == "decoder":
+                self.residue_type_logits_head = InverseFoldingHead(
+                    dim_latent=kwargs["dim_latent"],
+                    num_residue_types=22,
                 )
             
     def _set_registers(self, registers):
@@ -1085,15 +1086,36 @@ class ProteinTransformerAF3(torch.nn.Module):
         r = self.num_registers
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:], seqs[:, :r, :]
     
-    def decode_residue_type(self, single_repr, temperature=0.1):
+    def decode_residue_type(self, single_repr, temperature=1.0, mask=None):
         """
         Decodes the residue type from the single representation.
+        
+        Args:
+            single_repr: Single representation tensor [bs, L, dim]
+            temperature: Sampling temperature (default 1.0, higher = more random)
+            mask: Optional mask tensor [bs, L] to exclude padding positions
         """
         if self.apply_inv_folding:
             residue_type_logits = self.residue_type_logits_head(single_repr)
-            probs = F.softmax(residue_type_logits / temperature, dim=-1)
+            
+            # Apply mask if provided to avoid sampling on padding positions
+            if mask is not None:
+                residue_type_logits = residue_type_logits * mask[..., None]
+            
+            # Apply temperature scaling with numerical stability
+            scaled_logits = residue_type_logits / max(temperature, 1e-8)
+            probs = F.softmax(scaled_logits, dim=-1)
+            
             bs, L, num_classes = probs.shape
-            return torch.multinomial(probs.view(-1, num_classes), num_samples=1).view(bs, L)
+            
+            # Sample from multinomial distribution
+            # For each position, sample one amino acid type
+            sampled_indices = torch.multinomial(
+                probs.view(-1, num_classes), 
+                num_samples=1
+            ).view(bs, L)
+            
+            return sampled_indices
         else:
             return None
 
@@ -1117,6 +1139,8 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         if self.module_type == "decoder":
             single_repr = batch_nn["single_repr"]
+            if self.apply_inv_folding:
+                residue_type_logits = self.residue_type_logits_head(single_repr) * mask[..., None]
             if self.sampling_ratio > 1:
                 single_repr = self.upsample(single_repr.mT, size=c.shape[-2]).mT
             if self.dim_latent is not None:
@@ -1127,6 +1151,12 @@ class ProteinTransformerAF3(torch.nn.Module):
         # Conditioning variables
         c = self.cond_factory(batch_nn)  # [b, n, dim_cond]
         c = self.transition_c_2(self.transition_c_1(c, mask), mask)  # [b, n, dim_cond]
+        if self.apply_inv_folding and self.module_type == "encoder":
+            # Handle padding values (-1) by replacing them with 0 for one_hot
+            residue_type = batch_nn["residue_type"].clone()
+            residue_type[residue_type == -1] = 21
+            restype_one_hot = F.one_hot(residue_type, num_classes=22)
+            c = c + self.encode_residue_type(restype_one_hot.float().to(c.device))
         if single_repr is not None and self.latent_add_place == "cond":
             if self.module_type != "decoder":
                 raise ValueError("single_repr as condition is only supported for decoder")
@@ -1214,8 +1244,8 @@ class ProteinTransformerAF3(torch.nn.Module):
                 nn_out["pair_pred"] = pair_pred
             nn_out["coors_pred"] = final_coors
             if self.apply_inv_folding:
-                assert single_repr is not None
-                residue_type_logits = self.residue_type_logits_head(single_repr)
+                assert residue_type_logits is not None
+                # residue_type_logits = self.residue_type_logits_head(single_repr)
                 nn_out["residue_type_logits"] = residue_type_logits
 
         return nn_out
@@ -1412,3 +1442,19 @@ class ProteinLatentTransformer(torch.nn.Module):
         seqs = self.linear_out(seqs)
         
         return {"single_repr_pred": seqs * mask[..., None]}
+
+
+class InverseFoldingHead(torch.nn.Module):
+    def __init__(self, **kwargs):
+        super(InverseFoldingHead, self).__init__()
+        self.dim_latent = kwargs["dim_latent"]
+        self.num_residue_types = kwargs["num_residue_types"]
+        self.residue_type_logits_head = torch.nn.Sequential(
+            torch.nn.Linear(self.dim_latent, self.dim_latent * 4),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(self.dim_latent * 4, self.num_residue_types),
+        )
+
+    def forward(self, single_repr):
+        return self.residue_type_logits_head(single_repr)
