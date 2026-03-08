@@ -1,7 +1,4 @@
 # Week 1 Progress Report — March 6–8, 2026
-
-**Vishak Kashyap K · IIIT Hyderabad · MLNS Course**
-
 ---
 
 ## 1. What Was Done
