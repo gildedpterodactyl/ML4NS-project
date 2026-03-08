@@ -428,6 +428,8 @@ class R3NFlowMatcher:
         dtype: Optional[torch.dtype] = None,
         single_repr = None,
         encoder_registers = None,
+        guidance_oracle = None,
+        guidance_scale: float = 0.0,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the full process starting from
@@ -490,6 +492,8 @@ class R3NFlowMatcher:
             clamp_val=gt_clamp_val,
         )
 
+        use_guidance = guidance_oracle is not None and guidance_scale > 0.0
+
         with torch.no_grad():
             x = self.sample_reference(
                 n, shape=(nsamples,), device=device, mask=coords_mask, dtype=dtype
@@ -540,7 +544,27 @@ class R3NFlowMatcher:
                         # ProteinAE-PLDM
                         nn_in["x_sc_latent"] = x_1_pred
 
-                x_1_pred, v = predict_clean_n_v(nn_in)
+                # --- TFG guidance: need grad through x → x_1_pred --------
+                if use_guidance:
+                    x_for_grad = x.detach().requires_grad_(True)
+                    nn_in["x_t"] = x_for_grad
+                    with torch.enable_grad():
+                        x_1_pred, v = predict_clean_n_v(nn_in)
+                        # Oracle gradient  ∂L/∂x_t  via x̂₁(x_t)
+                        from proteinfoundation.guidance.tfg_sampler import compute_guidance_gradient
+                        grad_guidance = compute_guidance_gradient(
+                            x_t=x_for_grad,
+                            x_1_pred=x_1_pred,
+                            coords_mask=coords_mask,
+                            oracle=guidance_oracle,
+                            guidance_scale=guidance_scale,
+                        )  # [b, n, 3]
+                    # Subtract guidance gradient from velocity (steers toward target)
+                    v = v.detach() - grad_guidance.detach()
+                    x_1_pred = x_1_pred.detach()
+                else:
+                    x_1_pred, v = predict_clean_n_v(nn_in)
+                # ----------------------------------------------------------
 
                 # Accomodate last few steps
                 if ts[step] > 0.99:

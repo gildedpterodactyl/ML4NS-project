@@ -210,3 +210,6 @@ wandb/
 store/
 output/
 inference/
+# Model checkpoints
+checkpoints/
+*.ckpt

@@ -590,6 +590,10 @@ class ProteinAE(ModelTrainerBase):
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
         dt = self.inf_cfg.get("dt", 0.0025)
         
+        # TFG guidance parameters (set externally via configure_inference)
+        guidance_oracle = getattr(self, "_guidance_oracle", None)
+        guidance_scale = getattr(self, "_guidance_scale", 0.0)
+        
         # Process based on mode
         if ae_mode == "autoencode":
             # Extract and encode input
@@ -670,6 +674,8 @@ class ProteinAE(ModelTrainerBase):
             mask=mask,
             coords_mask=coords_mask,
             single_repr=single_repr,
+            guidance_oracle=guidance_oracle,
+            guidance_scale=guidance_scale,
         )
         
         # Predict residue types if needed

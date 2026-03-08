@@ -330,6 +330,38 @@ def parse_arguments() -> argparse.Namespace:
         help="Name of the configuration file"
     )
     
+    # --- TFG Guidance arguments ---
+    parser.add_argument(
+        "--guidance_oracle",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Geometric oracle(s) for TFG guidance. Available: rg, contacts, hbond, clash"
+    )
+    
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help="Guidance scale (eta) for TFG. Higher = stronger guidance."
+    )
+    
+    parser.add_argument(
+        "--guidance_target",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Target value(s) for each oracle, in order. If not given, uses oracle defaults."
+    )
+    
+    parser.add_argument(
+        "--guidance_weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Weight for each oracle in the composite loss. Defaults to 1.0 for each."
+    )
+    
     return parser.parse_args()
 
 
@@ -373,7 +405,9 @@ def process_protein(
     output_dir: Path, 
     cfg: DictConfig,
     mode: str = "autoencode",
-    chains: str = "all"
+    chains: str = "all",
+    guidance_oracle=None,
+    guidance_scale: float = 0.0,
 ) -> None:
     """
     Process protein structure based on specified mode
@@ -385,6 +419,8 @@ def process_protein(
         cfg: Configuration parameters
         mode: Processing mode ('encode', 'decode', 'autoencode')
         chains: Protein chains to process
+        guidance_oracle: Optional geometric oracle for TFG guidance
+        guidance_scale: Guidance scale (eta) for TFG
     """
     logger.info(f"Processing PDB file: {pdb_path}")
     logger.info(f"Processing mode: {mode}")
@@ -392,6 +428,12 @@ def process_protein(
     
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set TFG guidance on the model if requested
+    if guidance_oracle is not None and guidance_scale > 0.0:
+        autoencoder.model._guidance_oracle = guidance_oracle
+        autoencoder.model._guidance_scale = guidance_scale
+        logger.info(f"TFG guidance enabled: scale={guidance_scale}, oracle={guidance_oracle}")
     
     if mode == "autoencode":
         # Full autoencoding pipeline
@@ -468,6 +510,37 @@ def main():
     logger.info(f"Using checkpoint: {ckpt_file}")
     autoencoder = ProteinAutoEncoder.from_checkpoint(cfg, ckpt_file)
     
+    # Build TFG guidance oracle if requested
+    guidance_oracle = None
+    guidance_scale = 0.0
+    if args.guidance_oracle:
+        from proteinfoundation.guidance.oracles import OracleRegistry
+        from proteinfoundation.guidance.tfg_sampler import CompositeOracle
+        
+        targets = args.guidance_target or [None] * len(args.guidance_oracle)
+        weights = args.guidance_weights or [1.0] * len(args.guidance_oracle)
+        
+        if len(targets) != len(args.guidance_oracle):
+            logger.error("Number of --guidance_target values must match number of --guidance_oracle names")
+            sys.exit(1)
+        
+        oracles = []
+        for name, target in zip(args.guidance_oracle, targets):
+            kwargs = {}
+            if target is not None:
+                kwargs["target"] = target
+            oracle = OracleRegistry.get(name, **kwargs)
+            oracles.append(oracle)
+            logger.info(f"  Oracle: {oracle}")
+        
+        if len(oracles) == 1:
+            guidance_oracle = oracles[0]
+        else:
+            guidance_oracle = CompositeOracle(oracles, weights)
+        
+        guidance_scale = args.guidance_scale
+        logger.info(f"TFG guidance: scale={guidance_scale}, oracles={args.guidance_oracle}")
+    
     # Process protein
     process_protein(
             autoencoder=autoencoder,
@@ -475,7 +548,9 @@ def main():
             output_dir=output_dir / pdb_path.stem,
             cfg=cfg,
             mode=args.mode,
-            chains=args.chains
+            chains=args.chains,
+            guidance_oracle=guidance_oracle,
+            guidance_scale=guidance_scale,
         )
 
 

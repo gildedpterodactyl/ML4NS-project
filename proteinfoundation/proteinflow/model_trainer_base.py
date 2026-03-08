@@ -480,6 +480,8 @@ class ModelTrainerBase(L.LightningModule):
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
+        guidance_oracle = None,
+        guidance_scale: float = 0.0,
         **kwargs,
     ) -> Dict[str, Tensor]:
         """
@@ -514,6 +516,8 @@ class ModelTrainerBase(L.LightningModule):
             fixed_structure_mask = fixed_structure_mask,
             single_repr = kwargs.get("single_repr", None),
             encoder_registers = kwargs.get("encoder_registers", None),
+            guidance_oracle=guidance_oracle,
+            guidance_scale=guidance_scale,
         )
 
 
