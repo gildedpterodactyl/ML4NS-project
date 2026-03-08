@@ -319,7 +319,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--config_path",
         type=str,
-        default="/home/shaoningli5190/ProteinAE/configs",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs"),
         help="Path to configuration directory"
     )
     

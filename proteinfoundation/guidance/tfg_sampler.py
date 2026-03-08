@@ -64,22 +64,20 @@ class CompositeOracle:
 
 
 def compute_guidance_gradient(
-    x_t: Tensor,
     x_1_pred: Tensor,
     coords_mask: Tensor,
     oracle: GeometricOracle | CompositeOracle,
     guidance_scale: float = 1.0,
 ) -> Tensor:
     """
-    Compute the TFG guidance gradient to add to the velocity field.
+    Compute the TFG guidance gradient to steer the velocity field.
 
-    This uses the *source-space* formulation: the gradient of the oracle
-    loss w.r.t. the current noisy sample  x_t  flows through the
-    prediction  x̂₁(x_t).
+    Takes ∂L/∂x̂₁ — the gradient of the oracle loss w.r.t. the
+    predicted clean sample.  This gradient is then used to modify
+    the velocity:  v_guided = v − η · ∂L/∂x̂₁.
 
     Parameters
     ----------
-    x_t          : [b, n, 3]  current noisy sample (needs grad)
     x_1_pred     : [b, n, 3]  predicted clean sample from the network
     coords_mask  : [b, n]     boolean mask
     oracle       : the oracle (or CompositeOracle) providing .loss()
@@ -87,25 +85,31 @@ def compute_guidance_gradient(
 
     Returns
     -------
-    grad_x_t : [b, n, 3]  gradient to *subtract* from velocity
-               (i.e.  v_guided = v − grad_x_t)
+    grad : [b, n, 3]  gradient to *subtract* from velocity
+           (i.e.  v_guided = v − grad)
     """
     if guidance_scale == 0.0:
-        return torch.zeros_like(x_t)
+        return torch.zeros_like(x_1_pred)
 
-    # We need x_1_pred to retain the computation graph back to x_t.
-    # The caller must have created x_1_pred with grad enabled for x_t.
-    loss = oracle.loss(x_1_pred, coords_mask)  # [b]
-    loss_sum = loss.sum()
+    # Lightning's predict_step runs under torch.inference_mode(), which
+    # prevents ANY autograd graph construction — even with enable_grad().
+    # We must exit inference_mode AND enable grad to compute oracle grads.
+    with torch.inference_mode(False):
+        with torch.enable_grad():
+            # Clone + requires_grad INSIDE the non-inference context
+            x_1 = x_1_pred.detach().clone().float().requires_grad_(True)
+            mask_float = coords_mask.detach().float()
 
-    # Backprop to get ∂L/∂x_t
-    grad = torch.autograd.grad(
-        loss_sum,
-        x_t,
-        create_graph=False,
-        retain_graph=False,
-    )[0]  # [b, n, 3]
+            loss = oracle.loss(x_1, mask_float)  # [b]
+            loss_sum = loss.sum()
+
+            grad = torch.autograd.grad(
+                loss_sum,
+                x_1,
+                create_graph=False,
+                retain_graph=False,
+            )[0]  # [b, n, 3]
 
     # Mask and scale
-    grad = grad * coords_mask.unsqueeze(-1)  # zero out padding
+    grad = grad * coords_mask.unsqueeze(-1).float()  # zero out padding
     return guidance_scale * grad  # [b, n, 3]

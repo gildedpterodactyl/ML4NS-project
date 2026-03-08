@@ -3,11 +3,10 @@
 #
 # Geometric oracles for Training-Free Guidance (TFG).
 #
-# Each oracle maps backbone coordinates  x ∈ R^{b × n × 3}  (nanometers)
+# Each oracle maps Cα coordinates  x ∈ R^{b × n_res × 3}  (nanometers)
 # to a *differentiable* scalar property  y ∈ R^{b}.
 #
-# ProteinAE convention: backbone atoms are interleaved [N, CA, C, O] per
-# residue, flattened into a single sequence dim  n = 4 × n_res.
+# ProteinAE operates in ca_only mode: x is [b, n_res, 3] of Cα atoms.
 # Coordinates are in **nanometers** (Angstroms / 10).
 #
 # References for the physical quantities:
@@ -81,6 +80,19 @@ class GeometricOracle(abc.ABC):
 
 
 # ---------------------------------------------------------------------------
+# Coordinate extraction helper
+# ---------------------------------------------------------------------------
+def _extract_ca(x: Tensor, mask: Tensor):
+    """Return (ca_coords [b, n_res, 3], ca_mask [b, n_res]).
+
+    ProteinAE always operates in ca_only mode, so x is already
+    [b, n_res, 3] of Cα coordinates.  We just ensure the mask
+    is float for downstream arithmetic.
+    """
+    return x, mask.float()
+
+
+# ---------------------------------------------------------------------------
 # 1. Radius of Gyration  (Rg)
 # ---------------------------------------------------------------------------
 class RadiusOfGyration(GeometricOracle):
@@ -100,16 +112,8 @@ class RadiusOfGyration(GeometricOracle):
         super().__init__("radius_of_gyration", target, direction)
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
-        # Extract Cα atoms: indices 1, 5, 9, ... in the interleaved layout
         b, n, _ = x.shape
-        n_res = n // 4
-        # Reshape to [b, n_res, 4, 3] and take atom index 1 (CA)
-        x_bb = x.reshape(b, n_res, 4, 3)
-        ca = x_bb[:, :, 1, :]  # [b, n_res, 3]
-
-        # Build CA mask from interleaved mask
-        m_bb = mask.reshape(b, n_res, 4)
-        ca_mask = m_bb[:, :, 1]  # [b, n_res]
+        ca, ca_mask = _extract_ca(x, mask)
 
         # Masked mean (center of mass)
         n_atoms = ca_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # [b, 1]
@@ -153,13 +157,8 @@ class ContactDensity(GeometricOracle):
         self.tau = tau  # nm
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
-        b, n, _ = x.shape
-        n_res = n // 4
-        x_bb = x.reshape(b, n_res, 4, 3)
-        ca = x_bb[:, :, 1, :]  # [b, n_res, 3]
-
-        m_bb = mask.reshape(b, n_res, 4)
-        ca_mask = m_bb[:, :, 1]  # [b, n_res]
+        ca, ca_mask = _extract_ca(x, mask)
+        n_res = ca.shape[1]
 
         # Pairwise distances  [b, n_res, n_res]
         diff = ca.unsqueeze(2) - ca.unsqueeze(1)  # [b, n_res, n_res, 3]
@@ -211,33 +210,27 @@ class HBondScore(GeometricOracle):
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         b, n, _ = x.shape
-        n_res = n // 4
-        x_bb = x.reshape(b, n_res, 4, 3)
+        # ProteinAE is always ca_only — use CA-CA distances as proxy
+        ca = x              # [b, n_res, 3]
+        ca_mask = mask.float()  # [b, n_res]
+        n_res = n
 
-        n_atom = x_bb[:, :, 0, :]  # N  [b, n_res, 3]
-        o_atom = x_bb[:, :, 3, :]  # O  [b, n_res, 3]
+        diff = ca.unsqueeze(2) - ca.unsqueeze(1)
+        dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
+        pair_mask = ca_mask.unsqueeze(2) * ca_mask.unsqueeze(1)
 
-        m_bb = mask.reshape(b, n_res, 4)
-        n_mask = m_bb[:, :, 0]  # [b, n_res]
-        o_mask = m_bb[:, :, 3]  # [b, n_res]
-
-        # N_i → O_j distances  [b, n_res_i, n_res_j]
-        diff = n_atom.unsqueeze(2) - o_atom.unsqueeze(1)  # [b, nres, nres, 3]
-        dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [b, nres, nres]
-
-        # Pair mask: both atoms real, |i-j| >= seq_sep
-        pair_mask = n_mask.unsqueeze(2) * o_mask.unsqueeze(1)  # [b, nres, nres]
+        # Sequence separation mask
         idx = torch.arange(n_res, device=x.device)
-        seq_dist = (idx.unsqueeze(1) - idx.unsqueeze(0)).abs()  # [nres, nres]
-        seq_mask = (seq_dist >= self.seq_sep).float().unsqueeze(0)  # [1, nres, nres]
+        seq_dist = (idx.unsqueeze(1) - idx.unsqueeze(0)).abs()
+        seq_mask = (seq_dist >= self.seq_sep).float().unsqueeze(0)
         pair_mask = pair_mask * seq_mask
 
-        # Soft H-bond counting
-        hbonds = torch.sigmoid(-(dist - self.d_cutoff) / self.tau)  # [b, nres, nres]
+        # Soft H-bond counting (CA-CA proxy)
+        hbonds = torch.sigmoid(-(dist - self.d_cutoff) / self.tau)
         hbonds = hbonds * pair_mask
 
-        n_atoms = n_mask.sum(dim=-1).clamp(min=1)  # [b]
-        hbond_per_res = hbonds.sum(dim=(-1, -2)) / n_atoms  # [b]
+        n_atoms_count = ca_mask.sum(dim=-1).clamp(min=1)
+        hbond_per_res = hbonds.sum(dim=(-1, -2)) / n_atoms_count
         return hbond_per_res
 
 
@@ -269,16 +262,8 @@ class ClashScore(GeometricOracle):
         self.seq_sep = seq_sep  # min residue separation (atoms within same or adjacent residue aren't clashes)
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
-        b, n, _ = x.shape
-        n_res = n // 4
-
-        # Pairwise distances among all backbone atoms
-        # For memory efficiency on large proteins, use CA only
-        x_bb = x.reshape(b, n_res, 4, 3)
-        ca = x_bb[:, :, 1, :]  # [b, n_res, 3]
-
-        m_bb = mask.reshape(b, n_res, 4)
-        ca_mask = m_bb[:, :, 1]  # [b, n_res]
+        ca, ca_mask = _extract_ca(x, mask)
+        n_res = ca.shape[1]
 
         diff = ca.unsqueeze(2) - ca.unsqueeze(1)  # [b, nres, nres, 3]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [b, nres, nres]

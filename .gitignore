@@ -213,3 +213,5 @@ inference/
 # Model checkpoints
 checkpoints/
 *.ckpt
+Miniforge3-Linux-x86_64.sh
+output_guided_rg/

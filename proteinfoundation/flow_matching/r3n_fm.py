@@ -544,26 +544,18 @@ class R3NFlowMatcher:
                         # ProteinAE-PLDM
                         nn_in["x_sc_latent"] = x_1_pred
 
-                # --- TFG guidance: need grad through x → x_1_pred --------
+                # --- TFG guidance ----------------------------------------
+                x_1_pred, v = predict_clean_n_v(nn_in)
                 if use_guidance:
-                    x_for_grad = x.detach().requires_grad_(True)
-                    nn_in["x_t"] = x_for_grad
-                    with torch.enable_grad():
-                        x_1_pred, v = predict_clean_n_v(nn_in)
-                        # Oracle gradient  ∂L/∂x_t  via x̂₁(x_t)
-                        from proteinfoundation.guidance.tfg_sampler import compute_guidance_gradient
-                        grad_guidance = compute_guidance_gradient(
-                            x_t=x_for_grad,
-                            x_1_pred=x_1_pred,
-                            coords_mask=coords_mask,
-                            oracle=guidance_oracle,
-                            guidance_scale=guidance_scale,
-                        )  # [b, n, 3]
+                    from proteinfoundation.guidance.tfg_sampler import compute_guidance_gradient
+                    grad_guidance = compute_guidance_gradient(
+                        x_1_pred=x_1_pred,
+                        coords_mask=coords_mask,
+                        oracle=guidance_oracle,
+                        guidance_scale=guidance_scale,
+                    )  # [b, n, 3]
                     # Subtract guidance gradient from velocity (steers toward target)
-                    v = v.detach() - grad_guidance.detach()
-                    x_1_pred = x_1_pred.detach()
-                else:
-                    x_1_pred, v = predict_clean_n_v(nn_in)
+                    v = v - grad_guidance
                 # ----------------------------------------------------------
 
                 # Accomodate last few steps
