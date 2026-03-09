@@ -215,3 +215,9 @@ checkpoints/
 *.ckpt
 Miniforge3-Linux-x86_64.sh
 output_guided_rg/
+output_contact/
+output_clash/
+output_hbond/
+output_rg_compact/
+output_rg_expand/
+output_rg_strong/
