@@ -221,3 +221,9 @@ output_hbond/
 output_rg_compact/
 output_rg_expand/
 output_rg_strong/
+output_all_contacts/
+output_all_baseline/
+output_all_clash/
+output_all_hbond/
+output_all_rg/
+examples/
