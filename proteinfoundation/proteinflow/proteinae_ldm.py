@@ -762,6 +762,7 @@ class ProteinLDM(ModelTrainerBase):
             fixed_sequence_mask = fixed_sequence_mask,
             fixed_structure_mask = fixed_structure_mask,
             single_repr = None,
+            **kwargs,
         )
     
     def predict_step(self, batch, batch_idx):
@@ -842,11 +843,13 @@ class ProteinLDM(ModelTrainerBase):
             x_motif=x_motif,
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
+            guidance_oracle=getattr(self, 'guidance_oracle', None),
+            guidance_scale=getattr(self, 'guidance_scale', 0.0),
         )
 
         # Predict residue types if needed
         pred_residue_type = None
-        if self.inf_cfg.inv_folding:
+        if self.inf_cfg.get("inv_folding", False):
             pred_residue_type = self.decoder.decode_residue_type(single_repr)
         
         sampling_args = self.inf_cfg.sampling_bbflow
@@ -864,8 +867,8 @@ class ProteinLDM(ModelTrainerBase):
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
             dtype=torch.float32,
-            schedule_mode=self.inf_cfg.schedule_ldm.schedule_mode,
-            schedule_p=self.inf_cfg.schedule_ldm.schedule_p,
+            schedule_mode=self.inf_cfg.schedule.schedule_mode,
+            schedule_p=self.inf_cfg.schedule.schedule_p,
             sampling_mode=sampling_args["sampling_mode"],
             sc_scale_noise=sampling_args["sc_scale_noise"],
             sc_scale_score=sampling_args["sc_scale_score"],

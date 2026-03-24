@@ -548,12 +548,14 @@ class R3NFlowMatcher:
                 x_1_pred, v = predict_clean_n_v(nn_in)
                 if use_guidance:
                     from proteinfoundation.guidance.tfg_sampler import compute_guidance_gradient
+                    # Select the correct mask dynamically depending on whether we are guiding 3D coordinates or latents
+                    active_mask = mask if x_1_pred.shape[-2] == mask.shape[-1] else coords_mask
                     grad_guidance = compute_guidance_gradient(
                         x_1_pred=x_1_pred,
-                        coords_mask=coords_mask,
+                        coords_mask=active_mask,
                         oracle=guidance_oracle,
                         guidance_scale=guidance_scale,
-                    )  # [b, n, 3]
+                    )  # [b, n, d]
                     # Subtract guidance gradient from velocity (steers toward target)
                     v = v - grad_guidance
                 # ----------------------------------------------------------

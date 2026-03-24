@@ -1,6 +1,6 @@
 # Project Plan: Steerable Latent Diffusion for ProteinAE
 
-**Lead Researcher:** Vishak Kashyap K
+**Lead R:** Vishak Kashyap K, Rohit Jeswanth
 **Institution:** International Institute of Information Technology (IIIT), Hyderabad
 **Focus:** High-Fidelity Protein Structure Generation via Enhanced Latent Diffusion
 

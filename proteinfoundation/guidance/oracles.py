@@ -303,9 +303,13 @@ class OracleRegistry:
     def get(cls, name: str, **kwargs) -> GeometricOracle:
         """Instantiate an oracle by name with optional kwargs (target, direction, …)."""
         name_lower = name.lower()
+        if name_lower == "latent_brightness":
+            from proteinfoundation.guidance.latent_regressor import LatentRegressorOracle
+            return LatentRegressorOracle(**kwargs)
+            
         if name_lower not in cls._ORACLES:
             raise ValueError(
-                f"Unknown oracle '{name}'. Available: {list(cls._ORACLES.keys())}"
+                f"Unknown oracle '{name}'. Available: {list(cls._ORACLES.keys()) + ['latent_brightness']}"
             )
         return cls._ORACLES[name_lower](**kwargs)
 

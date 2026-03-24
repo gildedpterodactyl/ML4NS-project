@@ -227,3 +227,22 @@ output_all_clash/
 output_all_hbond/
 output_all_rg/
 examples/
+# Datasets
+fp_pdbs/
+thermo_pdbs/
+latent_datasets/
+protein_metadata.csv
+thermo_protein_metadata.csv
+
+# Models
+models/
+
+# Scripts
+patch_oracles.py
+test_fpbase.py
+script-ProtSteer_v2.pdf
+
+# Reports
+Latent_Guided_Inference_Results.md
+Regression_Results_Report.md
+smtg.md
