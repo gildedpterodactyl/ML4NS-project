@@ -1,0 +1,23 @@
+{
+  "n_samples_total": 47,
+  "n_train": 38,
+  "n_test": 9,
+  "pooling": "mean",
+  "ridge_alpha": 1.0,
+  "train_metrics": {
+    "rmse": 6.528122638541568,
+    "mae": 4.183721371181796,
+    "r2": 0.10797686141579577
+  },
+  "test_metrics": {
+    "rmse": 6.8615506638814505,
+    "mae": 4.5649019311065455,
+    "r2": -0.49157900954768685
+  },
+  "metadata": "fireprot_metadata.csv",
+  "structures_dir": "fireprot_structures",
+  "checkpoint": "checkpoints/ae_r1_d8_v1.ckpt",
+  "device": "cuda",
+  "model_file": "regression/outputs/ridge_latent_tm_model.npz",
+  "predictions_file": "regression/outputs/test_predictions.csv"
+}

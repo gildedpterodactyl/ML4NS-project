@@ -5,9 +5,9 @@ import time
 import pandas as pd
 
 # --- Configuration ---
-TM_THRESHOLD = 80
-UNIQUE_TARGET = 50   # How many DIFFERENT proteins you actually want
-SEARCH_LIMIT = 500   # Query a larger pool to find enough unique structures
+TM_THRESHOLD = 40
+UNIQUE_TARGET = 300  # Try to realistically get all unique from 500 pool
+SEARCH_LIMIT = 500  # API max is 500 per request
 SAVE_DIR = "fireprot_structures"
 METADATA_FILE = "fireprot_metadata.csv"
 FIREPROT_API_URL = "https://loschmidt.chemi.muni.cz/fireprotdb/api/search"
@@ -15,22 +15,29 @@ FIREPROT_API_URL = "https://loschmidt.chemi.muni.cz/fireprotdb/api/search"
 if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
 
 # --- 1. Query FireProtDB ---
-query_obj = {"tree": {"variable": "TM", "operator": "GREATER_THAN", "value": TM_THRESHOLD}}
-params = {"query": json.dumps(query_obj), "limit": SEARCH_LIMIT, "format": "json"}
-
-print(f"Connecting to FireProtDB (Pool size: {SEARCH_LIMIT})...")
-response = requests.get(FIREPROT_API_URL, params=params) 
-data = response.json()
-print(f"Retrieved {len(data)} potential entries.")
-
-# --- 2. Extraction & Unique Download Logic ---
 metadata_list = []
 downloaded_files = set()
+offset = 0
 
-for entry in data:
-    # Break early if we hit our target number of unique structures
-    if len(downloaded_files) >= UNIQUE_TARGET:
+print(f"Connecting to FireProtDB to find {UNIQUE_TARGET} unique proteins...")
+
+while len(downloaded_files) < UNIQUE_TARGET:
+    query_obj = {"tree": {"variable": "TM", "operator": "GREATER_THAN", "value": TM_THRESHOLD}}
+    params = {"query": json.dumps(query_obj), "limit": SEARCH_LIMIT, "offset": offset, "format": "json"}
+    
+    response = requests.get(FIREPROT_API_URL, params=params)
+    if response.status_code != 200:
+        print(f"API Error at offset {offset}")
         break
+    data = response.json()
+    if not data:
+        print("No more data from API.")
+        break
+
+    for entry in data:
+        # Break early if we hit our target number of unique structures
+        if len(downloaded_files) >= UNIQUE_TARGET:
+            break
 
     seq_data = entry.get('sequence') or {}
     mutant_data = entry.get('mutant') or {}
@@ -99,6 +106,9 @@ for entry in data:
                 time.sleep(0.15) 
         except:
             continue
+    
+    # Increment offset after processing all entries in this batch
+    offset += SEARCH_LIMIT
 
 # --- 3. Save Metadata ---
 if metadata_list:

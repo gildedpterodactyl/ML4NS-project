@@ -245,12 +245,30 @@ def main() -> None:
     with torch.no_grad():
         for i, item in enumerate(samples, start=1):
             try:
+                # Help avoid fragmentation
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 latent = autoencoder.encode(item.path)
                 feat = pool_latent(latent, pooling=args.pooling)
                 feature_rows.append(feat)
                 tm_values.append(item.tm)
                 ids.append(item.protein_id)
                 files.append(item.filename)
+            except torch.cuda.OutOfMemoryError as exc:
+                print(f"[WARN] CUDA OOM for {item.filename}. Falling back to CPU for execution...")
+                torch.cuda.empty_cache()
+                model.to("cpu")
+                try:
+                    latent = autoencoder.encode(item.path)
+                    feat = pool_latent(latent, pooling=args.pooling)
+                    feature_rows.append(feat)
+                    tm_values.append(item.tm)
+                    ids.append(item.protein_id)
+                    files.append(item.filename)
+                except Exception as cpu_exc:
+                    print(f"[ERROR] Failed on CPU for {item.filename}: {cpu_exc}")
+                finally:
+                    model.to(device)  # Restore back to original device
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 print(f"[WARN] Skipping {item.filename}: {exc}")
 
