@@ -6,9 +6,9 @@ import numpy as np
 from Bio.PDB import PDBParser
 
 # --- Configuration ---
-UNIQUE_TARGET = 50
-SAVE_DIR = "protein_dataset"
-METADATA_FILE = "protein_properties.json"
+UNIQUE_TARGET = int(os.getenv("UNIQUE_TARGET", "50"))
+SAVE_DIR = os.getenv("SAVE_DIR", "protein_dataset")
+METADATA_FILE = os.getenv("METADATA_FILE", "protein_properties.json")
 SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 DOWNLOAD_BASE_URL = "https://files.rcsb.org/download/"
 
