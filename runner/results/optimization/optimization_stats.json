@@ -1,0 +1,23 @@
+{
+  "n_vectors": 100,
+  "n_steps": 50,
+  "latent_dim": 8,
+  "target_tm": 50.0,
+  "seed": 42,
+  "gradient_ascent": {
+    "initial_mean_log_score": -4556.200906598312,
+    "final_mean_log_score": -8.606830149196321,
+    "final_max_log_score": -0.00041015271563082933,
+    "final_min_log_score": -60.12791442871094,
+    "final_std_log_score": 15.109432197855575,
+    "mean_improvement": 4547.594076449115
+  },
+  "ess": {
+    "initial_mean_log_score": -4556.200906598312,
+    "final_mean_log_score": -0.5241305680765072,
+    "final_max_log_score": -9.989016689360142e-07,
+    "final_min_log_score": -3.1550467014312744,
+    "final_std_log_score": 0.6685943808289118,
+    "mean_improvement": 4555.6767760302355
+  }
+}

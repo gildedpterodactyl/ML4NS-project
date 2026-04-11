@@ -1,0 +1,30 @@
+{
+  "n_samples_total": 300,
+  "n_oom_gpu_retry_success": 0,
+  "n_oom_cpu_fallback": 0,
+  "n_skipped_oom_impossible": 0,
+  "n_skipped_oom": 0,
+  "n_skipped_oversize": 0,
+  "n_skipped": 0,
+  "n_train": 240,
+  "n_test": 60,
+  "pooling": "mean",
+  "ridge_alpha": 1.0,
+  "target_column": "radius_of_gyration",
+  "train_metrics": {
+    "rmse": 2.8834516828108887,
+    "mae": 1.9318884387844197,
+    "r2": 0.9449229295676131
+  },
+  "test_metrics": {
+    "rmse": 10.270677347334379,
+    "mae": 3.089346193717276,
+    "r2": 0.410915490736681
+  },
+  "metadata": "/home2/rohit.jeswanth/GPML4NS/runner/data/downloaded_300_properties.json",
+  "structures_dir": "fireprot_structures",
+  "checkpoint": "/home2/rohit.jeswanth/GPML4NS/model-checkpoints/ae_r1_d8_v1.ckpt",
+  "device": "cuda",
+  "model_file": "/home2/rohit.jeswanth/GPML4NS/runner/results/optimization/ridge_latent_radius_of_gyration_model.npz",
+  "predictions_file": "/home2/rohit.jeswanth/GPML4NS/runner/results/optimization/test_predictions.csv"
+}

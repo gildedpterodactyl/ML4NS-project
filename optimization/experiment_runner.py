@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-tm",
         type=float,
         default=65.0,
-        help="Target Tm value to optimize towards (default 65°C)",
+        help="Target scalar value to optimize towards (default 65.0)",
     )
     parser.add_argument(
         "--n-vectors",
@@ -105,7 +105,7 @@ def main() -> None:
     )
     latent_dim = target_fn.get_latent_dim()
     print(f"  Latent dimension: {latent_dim}")
-    print(f"  Target Tm: {args.target_tm}°C")
+    print(f"  Target value: {args.target_tm}")
 
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -104,7 +104,12 @@ class ProteinAutoEncoder:
     def from_checkpoint(cls, cfg: DictConfig, ckpt_file: Path) -> 'ProteinAutoEncoder':
         """Load model from checkpoint"""
         model = ProteinAE.load_from_checkpoint(str(ckpt_file), strict=True)
-        trainer = L.Trainer(accelerator="gpu", devices=1, logger=False, enable_progress_bar=False)
+        accelerator = os.getenv("AUTOENCODE_ACCELERATOR", "gpu")
+        if accelerator not in {"gpu", "cpu", "auto"}:
+            accelerator = "gpu"
+        if accelerator == "auto":
+            accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+        trainer = L.Trainer(accelerator=accelerator, devices=1, logger=False, enable_progress_bar=False)
         return cls(model, trainer)
     
     def _move_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,9 +266,9 @@ class OutputWriter:
                         overwrite=True,
                         no_indexing=True,
                     )
-                    # RMSD calculation
-                    rmsd = rmsd_metric(pred_coords[j], gt_coords[j])
-                    logger.info(f"RMSD: {rmsd}")
+                    # RMSD calculation (local, no designability dependency)
+                    rmsd = torch.sqrt(torch.mean(torch.sum((pred_coords[j] - gt_coords[j]) ** 2, dim=-1)))
+                    logger.info(f"RMSD: {float(rmsd):.4f}")
 
 
 def setup_logging() -> None:
