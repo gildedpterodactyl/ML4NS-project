@@ -6,25 +6,14 @@ Implementation of Algorithm 1 and Algorithm 2 from:
   Cabezas & Nemeth (2023). Transport Elliptical Slice Sampling.
   AISTATS 2023. arXiv:2210.10644v2
 
-Key idea:
-  Instead of running ESS directly in latent space z (which may be non-Gaussian),
-  TESS learns a normalizing flow T that maps z → u ≈ N(0, I), then runs ESS
-  in the transformed (approximately Gaussian) reference space u, and finally
-  maps accepted samples back to z via x = T(u).
+Critical fix: training-prior ellipse
+-------------------------------------
+Same issue as ESS: the TESS reference-space auxiliary variable v ~ N(0,I)
+defines ellipses in u-space. Since u = T^{-1}(z) ≈ z (flow starts as identity),
+this is equivalent to drawing from N(0,I) in z-space, which is 3-6σ OOD.
 
-Two-step procedure:
-  1. MAP OPTIMIZATION: train a normalizing flow T (affine coupling layers)
-     that minimises KL(T^{-1}_# π || N(0,I)) using warm-up ESS samples.
-  2. SAMPLING: run standard ESS in the reference space u, accepting proposals
-     u' = u·cos(θ) + v·sin(θ) according to the slice criterion on
-     log π(T(u')) + log |det J_T(u')|, then return x = T(u).
-
-Warm-start note
----------------
-Same issue as ESS: when target Rg << oracle intercept, the starting u
-has terrible score and the warm-up chain freezes.  We run a short
-gradient-ascent step in z-space before the warm-up to initialise u in a
-reasonable region.  This is controlled by warm_start (default True).
+Fix: pass x_mean/x_std to run_tess; v is drawn from N(x_mean, diag(x_std^2))
+in _one_tess_step so that all proposals stay in the oracle's training domain.
 
 References:
   - Cabezas & Nemeth, AISTATS 2023, arXiv:2210.10644v2
@@ -36,7 +25,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,23 +41,20 @@ class AffineCouplingLayer(nn.Module):
     One affine coupling block (Dinh et al. 2014, Eq. 7-8 of paper).
 
     Splits d-dim input into (x_A, x_B) of sizes (d-p, p).
-    The coupling function t: R^p → R^(d-p) × R^(d-p) is a 2-hidden-layer MLP.
+    The coupling function: R^p → R^(d-p) × R^(d-p) is a 2-hidden-layer MLP.
 
-        y_A = x_A * exp(s(x_B)) + t(x_B)   [scale-shift of first half]
-        y_B = x_B                            [identity on second half]
+        y_A = x_A * exp(s(x_B)) + t(x_B)
+        y_B = x_B
 
-    Forward: u → x  (reference → target space)
-    Inverse:  x → u  (target → reference space, needed for KL training)
-
-    Log |det J| = sum(s(x_B))  (sum of log-scales, no abs needed since exp > 0)
+    Log |det J| = sum(s(x_B))
     """
 
     def __init__(self, d: int, d_hidden: int = 32, reverse: bool = False):
         super().__init__()
         self.d = d
         self.reverse = reverse
-        self.p = d // 2           # pass-through dimension
-        self.q = d - self.p       # transformed dimension
+        self.p = d // 2
+        self.q = d - self.p
 
         self.net = nn.Sequential(
             nn.Linear(self.p, d_hidden),
@@ -77,7 +63,6 @@ class AffineCouplingLayer(nn.Module):
             nn.Tanh(),
             nn.Linear(d_hidden, self.q * 2),
         )
-        # Zero-init last layer so T starts as identity
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -94,11 +79,10 @@ class AffineCouplingLayer(nn.Module):
             return torch.cat([x_B, x_A], dim=-1)
 
     def forward(self, u: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """u → x  (forward / push-forward).  Returns (x, log_det_J)."""
+        """u → x.  Returns (x, log_det_J)."""
         u_A, u_B = self._split(u)
         st = self.net(u_B)
         s, t_shift = st[..., :self.q], st[..., self.q:]
-        # Clamp log-scales to ±5 for numerical stability in early training
         s = torch.clamp(s, -5.0, 5.0)
         x_A = u_A * torch.exp(s) + t_shift
         x = self._join(x_A, u_B)
@@ -106,7 +90,7 @@ class AffineCouplingLayer(nn.Module):
         return x, log_det
 
     def inverse(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x → u  (inverse / pull-back).  Returns (u, log_det_J_inv)."""
+        """x → u.  Returns (u, log_det_J_inv)."""
         x_A, x_B = self._split(x)
         st = self.net(x_B)
         s, t_shift = st[..., :self.q], st[..., self.q:]
@@ -119,16 +103,15 @@ class AffineCouplingLayer(nn.Module):
 
 class NormalizingFlow(nn.Module):
     """
-    Sequential composition of n_transforms pairs of alternating coupling layers
-    (G, D), i.e.  T = D_n ∘ G_n ∘ ... ∘ D_1 ∘ G_1  (paper Sec. 2.5).
+    Sequential composition of n_transforms pairs of alternating coupling layers.
     """
 
     def __init__(self, d: int, n_transforms: int = 2, d_hidden: int = 32):
         super().__init__()
         layers: List[AffineCouplingLayer] = []
         for i in range(n_transforms):
-            layers.append(AffineCouplingLayer(d, d_hidden, reverse=False))  # G
-            layers.append(AffineCouplingLayer(d, d_hidden, reverse=True))   # D
+            layers.append(AffineCouplingLayer(d, d_hidden, reverse=False))
+            layers.append(AffineCouplingLayer(d, d_hidden, reverse=True))
         self.layers = nn.ModuleList(layers)
 
     def forward(self, u: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -151,21 +134,17 @@ class NormalizingFlow(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# TESS core: Algorithm 1 (single step) and Algorithm 2 (adaptive)
+# TESS core
 # ---------------------------------------------------------------------------
 
 def _tess_log_accept(u: torch.Tensor, flow: NormalizingFlow, target_fn) -> float:
     """
-    Compute log acceptance value for TESS (Algorithm 1, step 8).
-
-        log π(T(u)) + log |det J_T(u)|
-
-    Clamps the log-det to ±50 to guard against NaN in early training.
+    log π(T(u)) + log |det J_T(u)|
     """
     with torch.no_grad():
-        u_batch = u.unsqueeze(0)          # [1, d]
-        x_batch, log_det = flow(u_batch)  # x = T(u), log|det J_T|
-        x = x_batch.squeeze(0)           # [d]
+        u_batch = u.unsqueeze(0)
+        x_batch, log_det = flow(u_batch)
+        x = x_batch.squeeze(0)
         oracle = target_fn(x)
         log_like = oracle.log_likelihood.item()
         log_det_val = float(torch.clamp(log_det, -50.0, 50.0).item())
@@ -177,16 +156,27 @@ def _one_tess_step(
     flow: NormalizingFlow,
     target_fn,
     max_attempts: int = 100,
+    x_mean: Optional[torch.Tensor] = None,
+    x_std:  Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, float, int]:
     """
     One iteration of Algorithm 1 (Transport ESS step).
+
+    Training-prior fix: v is drawn from N(x_mean, diag(x_std^2)) instead of
+    N(0,I) so that ellipse proposals in u-space correspond to valid latents
+    in the oracle's training domain after T is applied.
     """
     current_log_val = _tess_log_accept(u, flow, target_fn)
 
     w = random.uniform(0, 1)
     log_s = current_log_val + math.log(w + 1e-300)
 
-    v = torch.randn_like(u)
+    # Draw auxiliary variable from training prior
+    eps = torch.randn_like(u)
+    if x_mean is not None:
+        v = x_mean.to(u.device) + eps * x_std.to(u.device)
+    else:
+        v = eps  # fallback N(0,I)
 
     theta = random.uniform(0, 2 * math.pi)
     theta_min = theta - 2 * math.pi
@@ -216,10 +206,7 @@ def _train_flow(
     lr: float = 1e-3,
 ) -> None:
     """
-    Update flow parameters by minimising the forward KL (Eq. 5 of paper):
-        L(φ) = -1/k Σ_i [log p_u(T^{-1}(x_i)) + log |det J_{T^{-1}}(x_i)|]
-
-    Log-determinants are clamped to ±50 for numerical stability.
+    Minimise forward KL: L(φ) = -1/k Σ_i [log p_u(T^{-1}(x_i)) + log |det J_{T^{-1}}(x_i)|]
     """
     optimizer = optim.Adam(flow.parameters(), lr=lr)
     flow.train()
@@ -227,7 +214,6 @@ def _train_flow(
     for _ in range(m_steps):
         optimizer.zero_grad()
         u_batch, log_det_inv = flow.inverse(samples_x)
-        # Clamp log-det to prevent NaN in early epochs
         log_det_inv = torch.clamp(log_det_inv, -50.0, 50.0)
         d = u_batch.shape[-1]
         log_p_u = -0.5 * (u_batch ** 2).sum(-1) - 0.5 * d * math.log(2 * math.pi)
@@ -252,19 +238,17 @@ def run_tess(
     warm_start: bool = True,
     warm_steps: int = 20,
     warm_lr: float = 0.1,
+    x_mean: Optional[torch.Tensor] = None,
+    x_std:  Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, List[float]]:
     """
     Transport Elliptical Slice Sampling (Algorithm 2 from Cabezas & Nemeth 2023).
 
-    Unlike plain ESS which samples directly in z-space (which may be non-Gaussian),
-    TESS first learns a normalizing flow T: u → z that approximately maps the
-    prior N(0,I) onto the target distribution π(z), then runs ESS in the
-    approximately-Gaussian reference space u.
-
-    Warm-start option (default True): runs warm_steps of gradient ascent
-    in z-space to move z_start into a moderate-score region before the
-    warm-up ESS chains begin.  This prevents the warm-up from freezing
-    when the target Rg is far from the oracle intercept.
+    Training-prior fix
+    ------------------
+    Pass x_mean and x_std (from the oracle .npz) so that ellipse auxiliary
+    variables in _one_tess_step are drawn from N(x_mean, diag(x_std^2)).
+    This keeps proposals within the decoder's valid input domain.
 
     Args:
         z_start:        Initial latent vector [latent_dim]
@@ -279,6 +263,8 @@ def run_tess(
         warm_start:     Gradient-ascent pre-conditioning (default True)
         warm_steps:     Pre-conditioning steps (default 20)
         warm_lr:        Pre-conditioning learning rate (default 0.1)
+        x_mean:         Training-prior mean from oracle checkpoint [latent_dim]
+        x_std:          Training-prior std  from oracle checkpoint [latent_dim]
 
     Returns:
         z_final:    Final sample in latent space
@@ -287,7 +273,6 @@ def run_tess(
     d = z_start.shape[0]
     device = z_start.device
 
-    # Build and initialise normalising flow (identity at init)
     flow = NormalizingFlow(d=d, n_transforms=n_transforms, d_hidden=d_hidden).to(device)
     flow.eval()
 
@@ -303,28 +288,29 @@ def run_tess(
     else:
         z_init = z_start.clone().detach()
 
-    # Initialise u = T^{-1}(z_init) — identity at start → u ≈ z_init
     with torch.no_grad():
         u_batch, _ = flow.inverse(z_init.unsqueeze(0))
     u = u_batch.squeeze(0).detach()
 
     # -------------------------------------------------------------------
-    # PHASE 1: Warm-up — alternate sampling and flow training
+    # PHASE 1: Warm-up
     # -------------------------------------------------------------------
     print(f"  [TESS] Warm-up: {warmup_epochs} epochs × {warmup_chains} chains")
     for epoch in range(warmup_epochs):
         warmup_x_list = []
         u_chain = u.clone()
         for _ in range(warmup_chains):
-            u_chain, _, _ = _one_tess_step(u_chain, flow, target_fn)
+            u_chain, _, _ = _one_tess_step(
+                u_chain, flow, target_fn,
+                x_mean=x_mean, x_std=x_std,
+            )
             with torch.no_grad():
                 x_batch, _ = flow(u_chain.unsqueeze(0))
             warmup_x_list.append(x_batch.squeeze(0).detach())
-        warmup_x = torch.stack(warmup_x_list, dim=0)   # [k, d]
+        warmup_x = torch.stack(warmup_x_list, dim=0)
 
         _train_flow(flow, warmup_x, target_fn, m_steps=m_grad_steps, lr=flow_lr)
 
-        # Re-encode current z under updated flow
         with torch.no_grad():
             x_cur_batch, _ = flow(u.unsqueeze(0))
             u_batch_new, _ = flow.inverse(x_cur_batch)
@@ -333,13 +319,16 @@ def run_tess(
         print(f"  [TESS]  Warm-up epoch {epoch + 1}/{warmup_epochs} done")
 
     # -------------------------------------------------------------------
-    # PHASE 2: Sampling with fixed T (Algorithm 1 for `steps` iterations)
+    # PHASE 2: Sampling
     # -------------------------------------------------------------------
     trajectory: List[float] = []
     print(f"  [TESS] Sampling phase: {steps} steps")
 
     for step in range(steps):
-        u, _, attempts = _one_tess_step(u, flow, target_fn)
+        u, _, attempts = _one_tess_step(
+            u, flow, target_fn,
+            x_mean=x_mean, x_std=x_std,
+        )
 
         with torch.no_grad():
             x_batch, _ = flow(u.unsqueeze(0))
@@ -357,7 +346,6 @@ def run_tess(
                 f"attempts: {attempts}"
             )
 
-    # Return final z = T(u_final)
     with torch.no_grad():
         z_final_batch, _ = flow(u.unsqueeze(0))
     z_final = z_final_batch.squeeze(0).detach()

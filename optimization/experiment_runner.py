@@ -7,20 +7,26 @@ Orchestrates the full optimization pipeline for all three methods:
 2. ESS              — Elliptical Slice Sampling (Murray et al. 2010)
 3. TESS             — Transport ESS (Cabezas & Nemeth, AISTATS 2023)
 
+Critical fix: training-prior sampling
+-------------------------------------
+The oracle was trained on a collapsed posterior: all training latents
+lie in a tight cluster at x_mean ≈ [-0.83, 0.36, 0.59, 0.84, ...] with
+x_std ≈ [0.08-0.29]. The model prior N(0,I) is 3-6σ away in every dim.
+
+Using z ~ N(0,I) as start vectors causes:
+  - Decoder gets OOD inputs  → degenerate PDB → Rg ≈ 3-5 Å always
+  - Oracle predicts 50.6 Å at z=0 (should be ~26.8 Å = intercept)
+  - Oracle range for N(0,I): 48 ± 74 Å → physically impossible values
+
+Fix: always sample from N(x_mean, diag(x_std²)) — the training distribution.
+
 Temperature guidance
 --------------------
-The oracle scores -(pred - target)^2 / T.  With T=1 and a prediction
-range of ~20 Å (intercept≈26.8 Å, coef_norm≈9), targets below ~15 Å
-give log_score ≈ -(26.8-target)^2 at the starting point, which can be
-< -500.  ESS/TESS slice thresholds are then never exceeded by ellipse
-proposals and the chain freezes.
-
+With start vectors now in the correct region, score at z_start ≈ intercept.
 Rule of thumb: T ≈ (intercept - target)^2 / 4
   target=5  Å → T ≈ (26.8-5)^2/4  ≈ 119  → use --temperature 120
   target=20 Å → T ≈ (26.8-20)^2/4 ≈  12  → use --temperature 12
   target=30 Å → T ≈ (30-26.8)^2/4 ≈   3  → use --temperature 3
-Higher T flattens the landscape, enabling mixing; GA still converges
-because it follows the gradient deterministically.
 """
 
 from __future__ import annotations
@@ -95,8 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Warm-start ESS/TESS: run 20 gradient-ascent steps before the MCMC "
-            "chain so the starting point is already in a moderate-score region.  "
-            "Strongly recommended when target is far from the prior mean."
+            "chain so the starting point is already in a moderate-score region."
         ),
     )
     parser.add_argument(
@@ -159,6 +164,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=42,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--retrain-oracle",
+        action="store_true",
+        help=(
+            "Generate oracle retraining data: sample 500 z vectors from the "
+            "training prior N(x_mean, x_std^2), evaluate oracle-predicted Rg "
+            "for each, and save retrain_oracle_data.npz to --output-dir. "
+            "Use this data to retrain the ridge oracle on the actual decoder domain."
+        ),
+    )
     return parser
 
 
@@ -171,10 +186,6 @@ def _warm_start_z(
     """
     Run a short gradient ascent (no penalty) to move z_start into a
     region of non-trivial score before starting the MCMC chain.
-
-    This is critical when the target Rg is far below the oracle intercept
-    (e.g., target=5 Å, intercept=26.8 Å): without this step, every
-    ellipse proposal has an equally terrible score and ESS/TESS freeze.
     """
     z = z_start.clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([z], lr=lr)
@@ -184,6 +195,35 @@ def _warm_start_z(
         loss.backward()
         opt.step()
     return z.detach()
+
+
+def _load_prior_params(checkpoint_path: Path):
+    """Load x_mean and x_std from oracle checkpoint for training-prior sampling."""
+    with np.load(checkpoint_path) as d:
+        x_mean = torch.tensor(d["x_mean"], dtype=torch.float32)
+        x_std  = torch.tensor(d["x_std"],  dtype=torch.float32)
+        intercept = float(d["intercept"].flat[0])
+        coef = d["coef"]
+    return x_mean, x_std, intercept, coef
+
+
+def _sample_from_training_prior(
+    n: int,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Sample n vectors from the training distribution N(x_mean, diag(x_std^2)).
+
+    CRITICAL: Do NOT use torch.randn(n, d) — that samples from N(0,I) which is
+    3-6σ away from the oracle's training domain in every dimension.
+    The decoder maps N(0,I) inputs to degenerate proteins with Rg ≈ 3-5 Å.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+    eps = torch.randn(n, len(x_mean))
+    return x_mean.unsqueeze(0) + eps * x_std.unsqueeze(0)
 
 
 def main() -> None:
@@ -209,17 +249,20 @@ def main() -> None:
     )
     latent_dim = target_fn.get_latent_dim()
 
-    # Print a suggested temperature based on the oracle intercept
-    import numpy as _np
-    with _np.load(args.checkpoint) as _d:
-        _intercept = float(_d["intercept"].flat[0])
+    # Load prior params from oracle checkpoint
+    x_mean, x_std, _intercept, _coef = _load_prior_params(args.checkpoint)
     suggested_T = (_intercept - args.target_tm) ** 2 / 4
-    print(f"  Latent dimension: {latent_dim}")
-    print(f"  Oracle intercept: {_intercept:.2f}")
-    print(f"  Target value:     {args.target_tm}")
-    print(f"  Temperature used: {args.temperature}")
-    print(f"  Suggested T:      {suggested_T:.1f}  "
-          f"(= (intercept - target)^2 / 4 = ({_intercept:.1f} - {args.target_tm})^2 / 4)")
+
+    print(f"  Latent dimension:      {latent_dim}")
+    print(f"  Oracle intercept:      {_intercept:.2f} Å")
+    print(f"  Training prior mean:   {x_mean.numpy().round(4)}")
+    print(f"  Training prior std:    {x_std.numpy().round(4)}")
+    print(f"  Prior range (±3σ):     [{(x_mean - 3*x_std).numpy().round(2)}")
+    print(f"                          {(x_mean + 3*x_std).numpy().round(2)}]")
+    print(f"  z=0 distance from prior: {((torch.zeros(latent_dim) - x_mean) / x_std).abs().numpy().round(1)} σ")
+    print(f"  Target value:          {args.target_tm}")
+    print(f"  Temperature used:      {args.temperature}")
+    print(f"  Suggested T:           {suggested_T:.1f}")
     if abs(args.temperature - suggested_T) / max(suggested_T, 1) > 2:
         print(f"  [WARN] Temperature {args.temperature} differs significantly from "
               f"suggested {suggested_T:.1f}. ESS/TESS mixing may be poor.")
@@ -227,12 +270,58 @@ def main() -> None:
         print(f"  TESS n_transforms={args.tess_n_transforms}, "
               f"d_hidden={args.tess_d_hidden}, "
               f"warmup_epochs={args.tess_warmup_epochs}")
-    print(f"  ESS/TESS warm_start: {args.ess_warm_start}")
+    print(f"  ESS/TESS warm_start:   {args.ess_warm_start}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nGenerating {args.n_vectors} random starting vectors...")
-    start_vectors = torch.randn(args.n_vectors, latent_dim)
+    # ------------------------------------------------------------------
+    # Optional: generate oracle retraining data
+    # ------------------------------------------------------------------
+    if args.retrain_oracle:
+        print("\n" + "=" * 60)
+        print("GENERATING ORACLE RETRAINING DATA")
+        print("=" * 60)
+        n_retrain = 500
+        print(f"  Sampling {n_retrain} z vectors from training prior N(x_mean, x_std²)...")
+        z_retrain = _sample_from_training_prior(n_retrain, x_mean, x_std, seed=args.seed)
+        pred_rgs = []
+        with torch.no_grad():
+            for j in range(n_retrain):
+                out = target_fn(z_retrain[j])
+                pred_rgs.append(out.pred_value.item())
+        pred_rgs = np.array(pred_rgs)
+        out_npz = args.output_dir / "retrain_oracle_data.npz"
+        np.savez(
+            out_npz,
+            z=z_retrain.numpy(),
+            pred_rg=pred_rgs,
+            x_mean=x_mean.numpy(),
+            x_std=x_std.numpy(),
+        )
+        print(f"  Oracle-predicted Rg: {pred_rgs.mean():.2f} ± {pred_rgs.std():.2f} Å  "
+              f"[{pred_rgs.min():.2f}, {pred_rgs.max():.2f}]")
+        print(f"  Saved: {out_npz}")
+        print("")
+        print("  NEXT STEP: decode these z vectors to PDB, measure actual Rg,")
+        print("  then retrain ridge on (z → actual_Rg) using regression/train_oracle.py")
+        print("="*60 + "\n")
+
+    # ------------------------------------------------------------------
+    # Generate start vectors from TRAINING PRIOR, not N(0,I)
+    # ------------------------------------------------------------------
+    print(f"\nGenerating {args.n_vectors} start vectors from training prior "
+          f"N(x_mean, x_std²)...")
+    start_vectors = _sample_from_training_prior(args.n_vectors, x_mean, x_std, seed=args.seed)
+
+    # Sanity check: oracle should predict ~intercept ± a few Å
+    with torch.no_grad():
+        sample_preds = [target_fn(start_vectors[j]).pred_value.item()
+                        for j in range(min(20, args.n_vectors))]
+    sample_preds = np.array(sample_preds)
+    print(f"  Oracle-predicted Rg at start vectors: "
+          f"{sample_preds.mean():.2f} ± {sample_preds.std():.2f} Å  "
+          f"[{sample_preds.min():.2f}, {sample_preds.max():.2f}]")
+    print(f"  (Should be ≈ {_intercept:.1f} ± a few Å — if wildly off, retrain oracle)")
 
     all_trajectories = {
         "vector_id": [],
@@ -294,6 +383,8 @@ def main() -> None:
             z_start=z_mcmc_start,
             target_fn=target_fn,
             steps=args.n_steps,
+            x_mean=x_mean,
+            x_std=x_std,
         )
         z_final_ess[i] = z_final_ess_iter
         final_scores_ess.append(traj_ess[-1])
@@ -311,6 +402,8 @@ def main() -> None:
                 warmup_chains=args.tess_warmup_chains,
                 m_grad_steps=args.tess_m_grad_steps,
                 flow_lr=args.tess_flow_lr,
+                x_mean=x_mean,
+                x_std=x_std,
             )
             z_final_tess[i] = z_final_tess_iter
             final_scores_tess.append(traj_tess[-1])
@@ -438,8 +531,15 @@ Run the Rg pipeline with the correct temperature:
   $ bash runner/run_rg_pipeline.sh {args.target_tm} {args.n_vectors} \\
         {args.n_steps} {args.temperature}
 
-Or submit to SLURM:
-  $ sbatch runner/submit_rg_pipeline.slurm
+To generate oracle retraining data (recommended):
+  $ python -m optimization.experiment_runner \\
+      --checkpoint {args.checkpoint} \\
+      --target-tm {args.target_tm} \\
+      --n-vectors 1 --n-steps 1 \\
+      --retrain-oracle \\
+      --output-dir {args.output_dir}
+  Then decode retrain_oracle_data.npz z-vectors to PDB,
+  measure actual Rg, and retrain with regression/train_oracle.py
 """)
 
 

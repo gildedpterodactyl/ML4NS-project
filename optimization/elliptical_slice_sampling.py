@@ -6,26 +6,16 @@ ESS is an MCMC algorithm specifically designed for sampling from high-dimensiona
 Gaussian-like distributions. Unlike gradient-based optimization, ESS does NOT require
 gradients, making it more robust in non-smooth regions.
 
-Key properties:
-- Does NOT use PyTorch gradients (use torch.no_grad() for speed)
-- Requires NO tuning of step size or learning rate
-- Naturally handles high-dimensional spaces
-- Produces a sequence of samples from the likelihood distribution
+Critical fix: training-prior ellipse
+-------------------------------------
+The standard ESS auxiliary variable nu ~ N(0,I) defines ellipses in the
+model prior space. But the oracle's training latents lie in a tight cluster
+at x_mean ≈ [-0.83, 0.36, ...] with x_std ≈ [0.08-0.29] — 3-6σ away from
+N(0,I) in every dimension. Using nu ~ N(0,I) draws ellipses that mostly
+pass through OOD decoder regions → degenerate proteins → Rg ≈ 3-5 Å.
 
-The algorithm works by:
-1. Drawing an auxiliary "twin" variable nu ~ N(0, I)
-2. Finding a slice threshold through log-likelihood
-3. Searching an ellipse for points above the threshold
-4. Accepting when a valid point is found
-
-Warm-start note
----------------
-When the target Rg is far from the oracle mean (intercept≈26.8 Å), all
-points near z_start have similarly terrible scores and the chain freezes.
-Pass warm_start=True (default) to run 20 gradient-ascent steps that move
-z_start into a moderate-score region before the MCMC chain begins.  The
-warm-start result is only used as the MCMC initial point; it is NOT
-included in the returned trajectory.
+Fix: draw nu from N(x_mean, diag(x_std^2)) so ellipses stay within
+the training distribution where the decoder produces valid proteins.
 
 Reference:
   Murray, Iain M., Ryan P. Adams, and David JC MacKay.
@@ -37,7 +27,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -49,52 +39,33 @@ def run_ess(
     warm_start: bool = True,
     warm_steps: int = 20,
     warm_lr: float = 0.1,
+    x_mean: Optional[torch.Tensor] = None,
+    x_std:  Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, List[float]]:
     """
     Elliptical Slice Sampling (ESS) for latent space exploration.
 
-    This algorithm draws samples from a distribution proportional to:
-        P(z) ∝ exp(log_likelihood(z))
-
-    Unlike gradient ascent, ESS:
-    - Requires NO gradient computation during MCMC (only during warm-start)
-    - Requires NO learning rate tuning for the MCMC phase
-    - Explores multiple high-likelihood regions
-    - Produces an MCMC chain (samples, not just optimization)
-
-    Algorithm:
-        [Optional warm-start: 20 gradient-ascent steps to reach a
-         moderate-score region before starting the chain]
-
-        For each MCMC step:
-        1. Evaluate current log_likelihood: L = log p(z)
-        2. Draw slice threshold: L_slice = L + log(U), where U ~ Uniform(0,1)
-        3. Draw auxiliary variable: nu ~ N(0, I)  [called the "twin"]
-        4. Initialize bracket: theta ~ Uniform(0, 2π)
-        5. Search on ellipse: z' = z*cos(θ) + nu*sin(θ)
-           - If log_lik(z') > L_slice, accept z' and continue
-           - Otherwise, shrink the bracket and try a new angle
-        6. Accept z' as the next sample
+    Training-prior fix
+    ------------------
+    Pass x_mean and x_std (from the oracle .npz) so that the auxiliary
+    variable nu is drawn from N(x_mean, diag(x_std^2)) instead of N(0,I).
+    This keeps all ellipse proposals within the oracle's training domain,
+    where the decoder produces valid protein structures.
+    If x_mean/x_std are None, falls back to N(0,I) (legacy behaviour).
 
     Args:
         z_start:    Initial latent vector [latent_dim]
         target_fn:  Oracle function that returns OracleOutput
         steps:      Number of MCMC steps (default 50)
-        warm_start: Run gradient ascent to find a good starting point
-                    before beginning MCMC (default True).  Strongly
-                    recommended when the target is far from the prior mean.
+        warm_start: Run gradient ascent to find a good starting point (default True)
         warm_steps: Number of gradient-ascent warm-start steps (default 20)
         warm_lr:    Learning rate for warm-start gradient ascent (default 0.1)
+        x_mean:     Training-prior mean [latent_dim] from oracle checkpoint
+        x_std:      Training-prior std  [latent_dim] from oracle checkpoint
 
     Returns:
         - z_final: Final sample after all steps [latent_dim]
         - trajectory: List of accepted log_likelihood values at each step
-
-    Notes:
-        - The warm-start result is used only as z_0 for MCMC; it is NOT
-          added to the trajectory.
-        - Early MCMC samples may be influenced by z_0; consider discarding
-          them (burn-in) before analysis.
     """
     # Optional warm-start: short gradient ascent to escape the prior mean
     if warm_start:
@@ -109,6 +80,11 @@ def run_ess(
     else:
         z = z_start.clone().detach()
 
+    # Move prior params to same device as z
+    if x_mean is not None:
+        x_mean = x_mean.to(z.device)
+        x_std  = x_std.to(z.device)
+
     trajectory: List[float] = []
 
     with torch.no_grad():
@@ -121,8 +97,14 @@ def run_ess(
             u = random.uniform(0, 1)
             threshold_log_like = current_log_like + math.log(u)
 
-            # Step 3: Draw the auxiliary variable
-            nu = torch.randn_like(z)
+            # Step 3: Draw auxiliary variable from TRAINING PRIOR
+            # N(x_mean, diag(x_std^2)) instead of N(0,I)
+            # This ensures ellipse proposals stay in the decoder's valid region
+            eps = torch.randn_like(z)
+            if x_mean is not None:
+                nu = x_mean + eps * x_std
+            else:
+                nu = eps  # fallback: N(0,I) (legacy)
 
             # Step 4: Initialize the bracket
             theta = random.uniform(0, 2 * math.pi)
