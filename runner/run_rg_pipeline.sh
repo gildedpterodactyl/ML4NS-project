@@ -2,7 +2,14 @@
 # run_rg_pipeline.sh — Full Rg pipeline: Gradient Ascent, ESS, TESS
 #
 # Usage (from repo root):
-#   bash runner/run_rg_pipeline.sh [TARGET_TM] [N_VECTORS] [N_STEPS]
+#   bash runner/run_rg_pipeline.sh [TARGET_TM] [N_VECTORS] [N_STEPS] [TEMPERATURE]
+#
+# Temperature guidance (intercept ≈ 26.8 Å, coef_norm ≈ 9):
+#   T ≈ (intercept - target)^2 / 4
+#   target=5  Å → T ≈ 119  (default 120)
+#   target=20 Å → T ≈  12
+#   target=30 Å → T ≈   3
+#   target=50 Å → T ≈ 134  (target > intercept, same formula)
 #
 # Environment overrides (optional):
 #   DATA_DIR          – where downloaded PDBs live   (default: runner/data)
@@ -25,10 +32,14 @@ GPML_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT_DIR="$(cd "$GPML_DIR/.." && pwd)"
 cd "$GPML_DIR"
 
-# ── Configurable paths ────────────────────────────────────────────────────
+# ── Configurable parameters ───────────────────────────────────────────────
 TARGET_TM="${1:-50}"
 N_VECTORS="${2:-100}"
 N_STEPS="${3:-50}"
+# Default temperature: (26.8 - TARGET_TM)^2 / 4, floored at 1
+# Shell arithmetic is integer-only; we use awk for the float calculation.
+_DEFAULT_T="$(awk -v t="$TARGET_TM" 'BEGIN { v=(26.8-t)^2/4; print (v<1)?1:v }' 2>/dev/null || echo 100)"
+TEMPERATURE="${4:-${_DEFAULT_T}}"
 
 DATA_DIR="${DATA_DIR:-$SCRIPT_DIR/data}"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
@@ -168,7 +179,6 @@ compute_rg() {
         --input_dir   "$pdb_dir" \
         --label       "$label" \
         --output_csv  "$out_csv"
-    # Extract rg column → .npy so plot_rg_methods.py load_rg() finds it
     python - "$out_csv" "$out_npy" <<'PY'
 import sys, numpy as np, pandas as pd
 df = pd.read_csv(sys.argv[1])
@@ -181,7 +191,7 @@ PY
 echo ""
 echo "========================================================"
 echo "  Rg Pipeline  |  Target Tm = ${TARGET_TM}°C"
-echo "  n_vectors=${N_VECTORS}  n_steps=${N_STEPS}"
+echo "  n_vectors=${N_VECTORS}  n_steps=${N_STEPS}  temperature=${TEMPERATURE}"
 echo "========================================================"
 
 TAG="${TARGET_TM}"
@@ -199,13 +209,13 @@ PYTHONPATH="$GPML_DIR:${PYTHONPATH:-}" python -m optimization.experiment_runner 
     --target-tm   "$TARGET_TM" \
     --n-vectors   "$N_VECTORS" \
     --n-steps     "$N_STEPS" \
+    --temperature "$TEMPERATURE" \
     --output-dir  "$OPT_DIR"
 
 # ── Step 2: Decode z → PDB ────────────────────────────────────────────────
 echo ""
 echo "[2/4] Decoding latent vectors → PDB structures..."
 
-# method slug → z_final file stem
 declare -A Z_STEMS=(
     [gradient_ascent]="z_final_gradient_ascent"
     [ess]="z_final_ess"

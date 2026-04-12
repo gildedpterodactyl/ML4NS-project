@@ -7,10 +7,20 @@ Orchestrates the full optimization pipeline for all three methods:
 2. ESS              — Elliptical Slice Sampling (Murray et al. 2010)
 3. TESS             — Transport ESS (Cabezas & Nemeth, AISTATS 2023)
 
-Outputs feed into the protein-verification pipeline:
-  - Decode optimized z → PDB
-  - Score with ProteinMPNN
-  - Evaluate thermal stability with ESM2StabP and MDTraj
+Temperature guidance
+--------------------
+The oracle scores -(pred - target)^2 / T.  With T=1 and a prediction
+range of ~20 Å (intercept≈26.8 Å, coef_norm≈9), targets below ~15 Å
+give log_score ≈ -(26.8-target)^2 at the starting point, which can be
+< -500.  ESS/TESS slice thresholds are then never exceeded by ellipse
+proposals and the chain freezes.
+
+Rule of thumb: T ≈ (intercept - target)^2 / 4
+  target=5  Å → T ≈ (26.8-5)^2/4  ≈ 119  → use --temperature 120
+  target=20 Å → T ≈ (26.8-20)^2/4 ≈  12  → use --temperature 12
+  target=30 Å → T ≈ (30-26.8)^2/4 ≈   3  → use --temperature 3
+Higher T flattens the landscape, enabling mixing; GA still converges
+because it follows the gradient deterministically.
 """
 
 from __future__ import annotations
@@ -28,25 +38,37 @@ import random
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run gradient ascent, ESS, and TESS optimization on random latent vectors"
+        description="Run gradient ascent, ESS, and TESS optimization on random latent vectors",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         required=True,
-        help="Path to ridge_latent_tm_model.npz (trained TM oracle)",
+        help="Path to ridge_latent_*_model.npz (trained oracle)",
     )
     parser.add_argument(
         "--target-tm",
         type=float,
         default=65.0,
-        help="Target scalar value to optimize towards (default 65.0)",
+        help="Target scalar value to optimize towards",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=100.0,
+        help=(
+            "Likelihood temperature T: score = -(pred-target)^2 / T.  "
+            "Rule of thumb: T ≈ (oracle_intercept - target)^2 / 4.  "
+            "With intercept≈26.8 Å: target=5→T≈120, target=20→T≈12, "
+            "target=30→T≈3.  Default 100.0 is safe for most Rg targets."
+        ),
     )
     parser.add_argument(
         "--n-vectors",
         type=int,
         default=100,
-        help="Number of random starting vectors (default 100; up to 1000)",
+        help="Number of random starting vectors",
     )
     parser.add_argument(
         "--n-steps",
@@ -66,47 +88,64 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="L2 penalty weight for gradient ascent",
     )
+    # ESS options
+    parser.add_argument(
+        "--ess-warm-start",
+        action="store_true",
+        default=True,
+        help=(
+            "Warm-start ESS/TESS: run 20 gradient-ascent steps before the MCMC "
+            "chain so the starting point is already in a moderate-score region.  "
+            "Strongly recommended when target is far from the prior mean."
+        ),
+    )
+    parser.add_argument(
+        "--no-ess-warm-start",
+        dest="ess_warm_start",
+        action="store_false",
+        help="Disable ESS/TESS warm start (start MCMC from raw z_start)",
+    )
     # TESS-specific arguments
     parser.add_argument(
         "--tess-n-transforms",
         type=int,
         default=2,
-        help="Number of G-D coupling layer pairs in the TESS normalizing flow (default 2)",
+        help="Number of G-D coupling layer pairs in the TESS normalizing flow",
     )
     parser.add_argument(
         "--tess-d-hidden",
         type=int,
         default=32,
-        help="Hidden layer width for TESS coupling networks (default 32)",
+        help="Hidden layer width for TESS coupling networks",
     )
     parser.add_argument(
         "--tess-warmup-epochs",
         type=int,
         default=3,
-        help="Number of TESS warm-up epochs h (default 3)",
+        help="Number of TESS warm-up epochs h",
     )
     parser.add_argument(
         "--tess-warmup-chains",
         type=int,
         default=10,
-        help="TESS warm-up chains k per epoch (default 10)",
+        help="TESS warm-up chains k per epoch",
     )
     parser.add_argument(
         "--tess-m-grad-steps",
         type=int,
         default=10,
-        help="Adam steps m per TESS NF update (default 10)",
+        help="Adam steps m per TESS NF update",
     )
     parser.add_argument(
         "--tess-flow-lr",
         type=float,
         default=1e-3,
-        help="Adam learning rate for TESS NF training (default 1e-3)",
+        help="Adam learning rate for TESS NF training",
     )
     parser.add_argument(
         "--skip-tess",
         action="store_true",
-        help="Skip TESS (run only gradient ascent and ESS, as in the original pipeline)",
+        help="Skip TESS (run only gradient ascent and ESS)",
     )
     parser.add_argument(
         "--output-dir",
@@ -121,6 +160,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Random seed for reproducibility",
     )
     return parser
+
+
+def _warm_start_z(
+    z_start: torch.Tensor,
+    target_fn,
+    warm_steps: int = 20,
+    lr: float = 0.1,
+) -> torch.Tensor:
+    """
+    Run a short gradient ascent (no penalty) to move z_start into a
+    region of non-trivial score before starting the MCMC chain.
+
+    This is critical when the target Rg is far below the oracle intercept
+    (e.g., target=5 Å, intercept=26.8 Å): without this step, every
+    ellipse proposal has an equally terrible score and ESS/TESS freeze.
+    """
+    z = z_start.clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([z], lr=lr)
+    for _ in range(warm_steps):
+        opt.zero_grad()
+        loss = -target_fn(z).log_likelihood
+        loss.backward()
+        opt.step()
+    return z.detach()
 
 
 def main() -> None:
@@ -142,14 +205,29 @@ def main() -> None:
     target_fn = TargetFunction.from_checkpoint(
         model_path=args.checkpoint,
         target_value=args.target_tm,
+        temperature=args.temperature,
     )
     latent_dim = target_fn.get_latent_dim()
+
+    # Print a suggested temperature based on the oracle intercept
+    import numpy as _np
+    with _np.load(args.checkpoint) as _d:
+        _intercept = float(_d["intercept"].flat[0])
+    suggested_T = (_intercept - args.target_tm) ** 2 / 4
     print(f"  Latent dimension: {latent_dim}")
+    print(f"  Oracle intercept: {_intercept:.2f}")
     print(f"  Target value:     {args.target_tm}")
+    print(f"  Temperature used: {args.temperature}")
+    print(f"  Suggested T:      {suggested_T:.1f}  "
+          f"(= (intercept - target)^2 / 4 = ({_intercept:.1f} - {args.target_tm})^2 / 4)")
+    if abs(args.temperature - suggested_T) / max(suggested_T, 1) > 2:
+        print(f"  [WARN] Temperature {args.temperature} differs significantly from "
+              f"suggested {suggested_T:.1f}. ESS/TESS mixing may be poor.")
     if not args.skip_tess:
         print(f"  TESS n_transforms={args.tess_n_transforms}, "
               f"d_hidden={args.tess_d_hidden}, "
               f"warmup_epochs={args.tess_warmup_epochs}")
+    print(f"  ESS/TESS warm_start: {args.ess_warm_start}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -173,7 +251,8 @@ def main() -> None:
     final_scores_tess     = []
 
     methods = ["gradient_ascent", "ess"] + ([] if args.skip_tess else ["tess"])
-    print(f"\nRunning {', '.join(methods)} on {args.n_vectors} vectors ({args.n_steps} steps each)...\n")
+    print(f"\nRunning {', '.join(methods)} on {args.n_vectors} vectors "
+          f"({args.n_steps} steps each)...\n")
 
     for i in range(args.n_vectors):
         z_start = start_vectors[i]
@@ -184,7 +263,18 @@ def main() -> None:
             initial_scores.append(initial_log_score)
 
         print(f"Vector {i + 1}/{args.n_vectors}")
-        print(f"  Initial log_score: {initial_log_score:.4f}")
+        print(f"  Initial log_score: {initial_log_score:.4f}  "
+              f"(pred_rg={output.pred_value.item():.2f} Å)")
+
+        # Warm-start for MCMC methods
+        if args.ess_warm_start:
+            z_mcmc_start = _warm_start_z(z_start, target_fn)
+            with torch.no_grad():
+                ws_out = target_fn(z_mcmc_start)
+            print(f"  Warm-start log_score: {ws_out.log_likelihood.item():.4f}  "
+                  f"(pred_rg={ws_out.pred_value.item():.2f} Å)")
+        else:
+            z_mcmc_start = z_start
 
         # ── Gradient Ascent ────────────────────────────────────────────
         print(f"  → Running Gradient Ascent...")
@@ -201,7 +291,7 @@ def main() -> None:
         # ── ESS ────────────────────────────────────────────────────────
         print(f"  → Running ESS...")
         z_final_ess_iter, traj_ess = run_ess(
-            z_start=z_start,
+            z_start=z_mcmc_start,
             target_fn=target_fn,
             steps=args.n_steps,
         )
@@ -212,7 +302,7 @@ def main() -> None:
         if not args.skip_tess:
             print(f"  → Running TESS...")
             z_final_tess_iter, traj_tess = run_tess(
-                z_start=z_start,
+                z_start=z_mcmc_start,
                 target_fn=target_fn,
                 steps=args.n_steps,
                 n_transforms=args.tess_n_transforms,
@@ -226,10 +316,18 @@ def main() -> None:
             final_scores_tess.append(traj_tess[-1])
 
         print(f"  Results:")
-        print(f"    Gradient Ascent: {traj_ga[-1]:.4f} (Δ={traj_ga[-1] - initial_log_score:+.4f})")
-        print(f"    ESS:             {traj_ess[-1]:.4f} (Δ={traj_ess[-1] - initial_log_score:+.4f})")
+        with torch.no_grad():
+            ga_pred  = target_fn(z_final_ga).pred_value.item()
+            ess_pred = target_fn(z_final_ess_iter).pred_value.item()
+        print(f"    Gradient Ascent: score={traj_ga[-1]:.4f}  pred_rg={ga_pred:.2f} Å  "
+              f"(Δ={traj_ga[-1] - initial_log_score:+.4f})")
+        print(f"    ESS:             score={traj_ess[-1]:.4f}  pred_rg={ess_pred:.2f} Å  "
+              f"(Δ={traj_ess[-1] - initial_log_score:+.4f})")
         if not args.skip_tess:
-            print(f"    TESS:            {traj_tess[-1]:.4f} (Δ={traj_tess[-1] - initial_log_score:+.4f})")
+            with torch.no_grad():
+                tess_pred = target_fn(z_final_tess_iter).pred_value.item()
+            print(f"    TESS:            score={traj_tess[-1]:.4f}  pred_rg={tess_pred:.2f} Å  "
+                  f"(Δ={traj_tess[-1] - initial_log_score:+.4f})")
         print()
 
         for step, score_ga in enumerate(traj_ga):
@@ -265,29 +363,38 @@ def main() -> None:
     print(f"✓ Saved optimized vectors in {args.output_dir}")
 
     # Compute statistics
-    def _stats(scores_final, scores_initial):
+    def _stats(scores_final, scores_initial, z_finals):
         arr_f = np.array(scores_final)
         arr_i = np.array(scores_initial)
+        with torch.no_grad():
+            preds = np.array([target_fn(z_finals[j]).pred_value.item()
+                              for j in range(len(z_finals))])
         return {
-            "initial_mean_log_score": float(np.mean(arr_i)),
-            "final_mean_log_score":   float(np.mean(arr_f)),
-            "final_max_log_score":    float(np.max(arr_f)),
-            "final_min_log_score":    float(np.min(arr_f)),
-            "final_std_log_score":    float(np.std(arr_f)),
-            "mean_improvement":       float(np.mean(arr_f - arr_i)),
+            "initial_mean_log_score":  float(np.mean(arr_i)),
+            "final_mean_log_score":    float(np.mean(arr_f)),
+            "final_max_log_score":     float(np.max(arr_f)),
+            "final_min_log_score":     float(np.min(arr_f)),
+            "final_std_log_score":     float(np.std(arr_f)),
+            "mean_improvement":        float(np.mean(arr_f - arr_i)),
+            "pred_rg_mean":            float(np.mean(preds)),
+            "pred_rg_std":             float(np.std(preds)),
+            "pred_rg_min":             float(np.min(preds)),
+            "pred_rg_max":             float(np.max(preds)),
         }
 
     stats = {
-        "n_vectors":  args.n_vectors,
-        "n_steps":    args.n_steps,
-        "latent_dim": latent_dim,
-        "target_tm":  args.target_tm,
-        "seed":       args.seed,
-        "gradient_ascent": _stats(final_scores_gradient, initial_scores),
-        "ess":             _stats(final_scores_ess,      initial_scores),
+        "n_vectors":   args.n_vectors,
+        "n_steps":     args.n_steps,
+        "latent_dim":  latent_dim,
+        "target_tm":   args.target_tm,
+        "temperature": args.temperature,
+        "seed":        args.seed,
+        "oracle_intercept": _intercept,
+        "gradient_ascent": _stats(final_scores_gradient, initial_scores, z_final_gradient),
+        "ess":             _stats(final_scores_ess,      initial_scores, z_final_ess),
     }
     if not args.skip_tess:
-        stats["tess"] = _stats(final_scores_tess, initial_scores)
+        stats["tess"] = _stats(final_scores_tess, initial_scores, z_final_tess)
 
     stats_json = args.output_dir / "optimization_stats.json"
     stats_json.write_text(json.dumps(stats, indent=2))
@@ -300,11 +407,13 @@ def main() -> None:
 
     def _print_method(name, s):
         print(f"\n{name}:")
-        print(f"  Mean initial score:  {s['initial_mean_log_score']:8.4f}")
-        print(f"  Mean final score:    {s['final_mean_log_score']:8.4f}")
-        print(f"  Mean improvement:    {s['mean_improvement']:+8.4f}")
-        print(f"  Best score:          {s['final_max_log_score']:8.4f}")
-        print(f"  Score std:           {s['final_std_log_score']:8.4f}")
+        print(f"  Mean initial score:   {s['initial_mean_log_score']:8.4f}")
+        print(f"  Mean final score:     {s['final_mean_log_score']:8.4f}")
+        print(f"  Mean improvement:     {s['mean_improvement']:+8.4f}")
+        print(f"  Best score:           {s['final_max_log_score']:8.4f}")
+        print(f"  Score std:            {s['final_std_log_score']:8.4f}")
+        print(f"  Pred Rg mean ± std:   {s['pred_rg_mean']:.2f} ± {s['pred_rg_std']:.2f} Å  "
+              f"[{s['pred_rg_min']:.2f}, {s['pred_rg_max']:.2f}]")
 
     _print_method("Gradient Ascent", stats["gradient_ascent"])
     _print_method("Elliptical Slice Sampling (ESS)", stats["ess"])
@@ -319,20 +428,18 @@ def main() -> None:
     if not args.skip_tess:
         candidates["TESS"] = stats["tess"]["mean_improvement"]
     winner = max(candidates, key=candidates.get)
-    print(f"\n🏆 Winner (by mean improvement): {winner}")
+    print(f"\n\U0001f3c6 Winner (by mean improvement): {winner}")
 
     print("\n" + "=" * 70)
     print("NEXT STEPS: Validation Pipeline")
     print("=" * 70)
-    print("""
-Run the Rg pipeline for all three methods:
-  $ bash runner/run_rg_pipeline.sh
+    print(f"""
+Run the Rg pipeline with the correct temperature:
+  $ bash runner/run_rg_pipeline.sh {args.target_tm} {args.n_vectors} \\
+        {args.n_steps} {args.temperature}
 
 Or submit to SLURM:
   $ sbatch runner/submit_rg_pipeline.slurm
-
-The pipeline will decode z_final_tess.pt → PDB → Rg and compare
-radius of gyration distributions across all three methods.
 """)
 
 

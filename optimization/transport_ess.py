@@ -19,15 +19,12 @@ Two-step procedure:
      u' = u·cos(θ) + v·sin(θ) according to the slice criterion on
      log π(T(u')) + log |det J_T(u')|, then return x = T(u).
 
-The log-acceptance criterion (Algorithm 1, step 8) is:
-  log π(T(u')) + log |det J_T(u')| > log s
-  where log s is the slice threshold set at the current state's value.
-
-Normalizing flow architecture:
-  Affine coupling layers (NICE/RealNVP style, Dinh et al. 2014).
-  For d-dimensional input, we use n_transforms pairs of (G, D) coupling blocks,
-  each a dense feedforward network. This gives a flexible, cheaply invertible
-  diffeomorphism whose Jacobian log-determinant is trivially computable.
+Warm-start note
+---------------
+Same issue as ESS: when target Rg << oracle intercept, the starting u
+has terrible score and the warm-up chain freezes.  We run a short
+gradient-ascent step in z-space before the warm-up to initialise u in a
+reasonable region.  This is controlled by warm_start (default True).
 
 References:
   - Cabezas & Nemeth, AISTATS 2023, arXiv:2210.10644v2
@@ -70,12 +67,9 @@ class AffineCouplingLayer(nn.Module):
         super().__init__()
         self.d = d
         self.reverse = reverse
-        # Split: if reverse=False → (0..p-1) are transformed, p..d-1 are pass-through
-        #        if reverse=True  → swap roles (alternating as in paper Sec. 2.5)
         self.p = d // 2           # pass-through dimension
         self.q = d - self.p       # transformed dimension
 
-        # MLP: p → (q scale, q shift)
         self.net = nn.Sequential(
             nn.Linear(self.p, d_hidden),
             nn.Tanh(),
@@ -89,9 +83,9 @@ class AffineCouplingLayer(nn.Module):
 
     def _split(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.reverse:
-            return x[..., :self.q], x[..., self.q:]  # (transformed, pass-through)
+            return x[..., :self.q], x[..., self.q:]
         else:
-            return x[..., self.p:], x[..., :self.p]  # (transformed, pass-through)
+            return x[..., self.p:], x[..., :self.p]
 
     def _join(self, x_A: torch.Tensor, x_B: torch.Tensor) -> torch.Tensor:
         if not self.reverse:
@@ -104,6 +98,8 @@ class AffineCouplingLayer(nn.Module):
         u_A, u_B = self._split(u)
         st = self.net(u_B)
         s, t_shift = st[..., :self.q], st[..., self.q:]
+        # Clamp log-scales to ±5 for numerical stability in early training
+        s = torch.clamp(s, -5.0, 5.0)
         x_A = u_A * torch.exp(s) + t_shift
         x = self._join(x_A, u_B)
         log_det = s.sum(dim=-1)
@@ -114,6 +110,7 @@ class AffineCouplingLayer(nn.Module):
         x_A, x_B = self._split(x)
         st = self.net(x_B)
         s, t_shift = st[..., :self.q], st[..., self.q:]
+        s = torch.clamp(s, -5.0, 5.0)
         u_A = (x_A - t_shift) * torch.exp(-s)
         u = self._join(u_A, x_B)
         log_det_inv = -s.sum(dim=-1)
@@ -124,9 +121,6 @@ class NormalizingFlow(nn.Module):
     """
     Sequential composition of n_transforms pairs of alternating coupling layers
     (G, D), i.e.  T = D_n ∘ G_n ∘ ... ∘ D_1 ∘ G_1  (paper Sec. 2.5).
-
-    Forward (u → x):  apply layers in order
-    Inverse (x → u):  apply layers in reverse
     """
 
     def __init__(self, d: int, n_transforms: int = 2, d_hidden: int = 32):
@@ -164,12 +158,9 @@ def _tess_log_accept(u: torch.Tensor, flow: NormalizingFlow, target_fn) -> float
     """
     Compute log acceptance value for TESS (Algorithm 1, step 8).
 
-    For the extended target π(x)·N(v|0,I) we need:
         log π(T(u)) + log |det J_T(u)|
-    where T maps reference space u → target space x.
 
-    The log |det J_T| term is the change-of-variables correction that makes
-    the TESS accept/reject criterion exactly target π(x), not a biased version.
+    Clamps the log-det to ±50 to guard against NaN in early training.
     """
     with torch.no_grad():
         u_batch = u.unsqueeze(0)          # [1, d]
@@ -177,7 +168,7 @@ def _tess_log_accept(u: torch.Tensor, flow: NormalizingFlow, target_fn) -> float
         x = x_batch.squeeze(0)           # [d]
         oracle = target_fn(x)
         log_like = oracle.log_likelihood.item()
-        log_det_val = log_det.item()
+        log_det_val = float(torch.clamp(log_det, -50.0, 50.0).item())
     return log_like + log_det_val
 
 
@@ -189,15 +180,6 @@ def _one_tess_step(
 ) -> Tuple[torch.Tensor, float, int]:
     """
     One iteration of Algorithm 1 (Transport ESS step).
-
-    Steps:
-      1. v ~ N(0, I)
-      2. w ~ Uniform(0,1); log s = log π(T(u)) + log|det J| + log w
-      3. θ ~ Uniform(0, 2π); bracket [θ_min, θ_max]
-      4. Propose u' = u·cos(θ) + v·sin(θ) on the ellipse
-      5. Accept if log π(T(u')) + log|det J_T(u')| > log s; else shrink bracket
-
-    Returns (u_new, log_accept_value, n_attempts).
     """
     current_log_val = _tess_log_accept(u, flow, target_fn)
 
@@ -228,42 +210,27 @@ def _one_tess_step(
 
 def _train_flow(
     flow: NormalizingFlow,
-    samples_u: torch.Tensor,
     samples_x: torch.Tensor,
     target_fn,
     m_steps: int = 10,
     lr: float = 1e-3,
 ) -> None:
     """
-    Update flow parameters by minimising the forward KL:
-        KL(π || T_# N) ≈ -1/k Σ_i [log π(x_i) - log π̂(x_i)]
-    where π̂(x) = N(T^{-1}(x)) |det J_{T^{-1}}(x)| is the NF approximation.
+    Update flow parameters by minimising the forward KL (Eq. 5 of paper):
+        L(φ) = -1/k Σ_i [log p_u(T^{-1}(x_i)) + log |det J_{T^{-1}}(x_i)|]
 
-    Concretely we minimise the Monte Carlo estimate of Eq. (5) in the paper:
-        L(φ) = -1/k Σ_i [log π(x_i) + log |det J_{T^{-1}}(x_i)|]
-              = -1/k Σ_i [log_like(x_i) + log_det_inv(x_i)]
-
-    This pushes the NF to "cover" the mass of π (forward KL, overconfident,
-    as discussed in paper Sec. 2.4 — this is intentional for TESS).
+    Log-determinants are clamped to ±50 for numerical stability.
     """
     optimizer = optim.Adam(flow.parameters(), lr=lr)
     flow.train()
 
     for _ in range(m_steps):
         optimizer.zero_grad()
-        # Pull back samples x → u
         u_batch, log_det_inv = flow.inverse(samples_x)
-        # Gaussian log-density of u: -0.5 * ||u||^2 - d/2 * log(2π)
+        # Clamp log-det to prevent NaN in early epochs
+        log_det_inv = torch.clamp(log_det_inv, -50.0, 50.0)
         d = u_batch.shape[-1]
         log_p_u = -0.5 * (u_batch ** 2).sum(-1) - 0.5 * d * math.log(2 * math.pi)
-        # Log-likelihood of x: log π(x) = log_like(x_i) for each sample
-        # We use the stored oracle scores (detached) as the target signal
-        with torch.no_grad():
-            log_likes = torch.tensor(
-                [target_fn(samples_x[i]).log_likelihood.item() for i in range(len(samples_x))],
-                dtype=torch.float32,
-            )
-        # Minimise KL: equiv. to maximising E[log p_u(T^{-1}(x)) + log|det J_inv|(x)]
         loss = -(log_p_u + log_det_inv).mean()
         loss.backward()
         nn.utils.clip_grad_norm_(flow.parameters(), max_norm=5.0)
@@ -282,6 +249,9 @@ def run_tess(
     warmup_chains: int = 10,
     m_grad_steps: int = 10,
     flow_lr: float = 1e-3,
+    warm_start: bool = True,
+    warm_steps: int = 20,
+    warm_lr: float = 0.1,
 ) -> Tuple[torch.Tensor, List[float]]:
     """
     Transport Elliptical Slice Sampling (Algorithm 2 from Cabezas & Nemeth 2023).
@@ -291,53 +261,51 @@ def run_tess(
     prior N(0,I) onto the target distribution π(z), then runs ESS in the
     approximately-Gaussian reference space u.
 
-    The two-phase procedure:
-
-    PHASE 1 – Warm-up (map optimization, Algorithm 2 lines 2-7):
-      For h epochs:
-        - Run `warmup_chains` short ESS chains from z_start (no flow, plain ESS)
-          to collect rough samples from π
-        - Update flow T by minimising KL(π || T_# N) on those samples
-
-    PHASE 2 – Sampling (Algorithm 2 lines 9-13):
-      Run `steps` iterations of Algorithm 1 (TESS step) using the fixed T:
-        - Work in reference space u = T^{-1}(z)
-        - Propose u' on an ellipse with auxiliary v ~ N(0,I)
-        - Accept if log π(T(u')) + log|det J_T(u')| > log s  (slice threshold)
-        - Return x = T(u_accepted)
+    Warm-start option (default True): runs warm_steps of gradient ascent
+    in z-space to move z_start into a moderate-score region before the
+    warm-up ESS chains begin.  This prevents the warm-up from freezing
+    when the target Rg is far from the oracle intercept.
 
     Args:
         z_start:        Initial latent vector [latent_dim]
-        target_fn:      Oracle returning OracleOutput.log_likelihood (as in ESS)
-        steps:          Number of MCMC steps in the sampling phase (default 50)
-        n_transforms:   Number of G-D coupling layer pairs in the NF (default 2)
-        d_hidden:       Hidden layer width of coupling MLP networks (default 32)
-        warmup_epochs:  Number of warm-up epochs h (default 3)
-        warmup_chains:  Chains k run per warm-up epoch (default 10)
+        target_fn:      Oracle returning OracleOutput.log_likelihood
+        steps:          MCMC sampling steps in Phase 2 (default 50)
+        n_transforms:   G-D coupling layer pairs in the NF (default 2)
+        d_hidden:       Hidden width of coupling MLPs (default 32)
+        warmup_epochs:  Warm-up epochs h (default 3)
+        warmup_chains:  Chains k per warm-up epoch (default 10)
         m_grad_steps:   Adam steps m per NF update (default 10)
         flow_lr:        Learning rate for Adam NF training (default 1e-3)
+        warm_start:     Gradient-ascent pre-conditioning (default True)
+        warm_steps:     Pre-conditioning steps (default 20)
+        warm_lr:        Pre-conditioning learning rate (default 0.1)
 
     Returns:
-        z_final:    Final sample in latent space (same shape as z_start)
+        z_final:    Final sample in latent space
         trajectory: List of accepted log_likelihood values (one per step)
-
-    Notes:
-        - The flow is initialised as identity, so early warm-up epochs use
-          approximately plain ESS, gradually improving.
-        - warmup_chains * warmup_epochs samples are used for KL training;
-          for d=8 this is very fast (< 1 second per epoch).
-        - The final z returned is T(u_final), i.e. in the original latent space.
     """
     d = z_start.shape[0]
     device = z_start.device
 
-    # Build and initialise normalising flow (identity at init due to zero last-layer)
+    # Build and initialise normalising flow (identity at init)
     flow = NormalizingFlow(d=d, n_transforms=n_transforms, d_hidden=d_hidden).to(device)
     flow.eval()
 
-    # Initialise u = T^{-1}(z_start) — since flow starts as identity, u ≈ z_start
+    # Optional gradient-ascent warm-start in z-space
+    if warm_start:
+        z_ws = z_start.clone().detach().requires_grad_(True)
+        opt_ws = torch.optim.Adam([z_ws], lr=warm_lr)
+        for _ in range(warm_steps):
+            opt_ws.zero_grad()
+            (-target_fn(z_ws).log_likelihood).backward()
+            opt_ws.step()
+        z_init = z_ws.detach()
+    else:
+        z_init = z_start.clone().detach()
+
+    # Initialise u = T^{-1}(z_init) — identity at start → u ≈ z_init
     with torch.no_grad():
-        u_batch, _ = flow.inverse(z_start.unsqueeze(0))
+        u_batch, _ = flow.inverse(z_init.unsqueeze(0))
     u = u_batch.squeeze(0).detach()
 
     # -------------------------------------------------------------------
@@ -345,7 +313,6 @@ def run_tess(
     # -------------------------------------------------------------------
     print(f"  [TESS] Warm-up: {warmup_epochs} epochs × {warmup_chains} chains")
     for epoch in range(warmup_epochs):
-        # Collect warm-up samples by running plain ESS on current T
         warmup_x_list = []
         u_chain = u.clone()
         for _ in range(warmup_chains):
@@ -354,15 +321,10 @@ def run_tess(
                 x_batch, _ = flow(u_chain.unsqueeze(0))
             warmup_x_list.append(x_batch.squeeze(0).detach())
         warmup_x = torch.stack(warmup_x_list, dim=0)   # [k, d]
-        warmup_u = torch.stack(
-            [flow.inverse(warmup_x[i:i+1])[0].squeeze(0).detach() for i in range(len(warmup_x))],
-            dim=0,
-        )  # [k, d]
 
-        # Update flow on warm-up samples
-        _train_flow(flow, warmup_u, warmup_x, target_fn, m_steps=m_grad_steps, lr=flow_lr)
+        _train_flow(flow, warmup_x, target_fn, m_steps=m_grad_steps, lr=flow_lr)
 
-        # Re-encode current u under updated flow
+        # Re-encode current z under updated flow
         with torch.no_grad():
             x_cur_batch, _ = flow(u.unsqueeze(0))
             u_batch_new, _ = flow.inverse(x_cur_batch)
@@ -379,7 +341,6 @@ def run_tess(
     for step in range(steps):
         u, _, attempts = _one_tess_step(u, flow, target_fn)
 
-        # Decode to latent space to get the oracle score to log
         with torch.no_grad():
             x_batch, _ = flow(u.unsqueeze(0))
             x = x_batch.squeeze(0)
@@ -396,7 +357,7 @@ def run_tess(
                 f"attempts: {attempts}"
             )
 
-    # Return final z = T(u_final) in original latent space
+    # Return final z = T(u_final)
     with torch.no_grad():
         z_final_batch, _ = flow(u.unsqueeze(0))
     z_final = z_final_batch.squeeze(0).detach()
