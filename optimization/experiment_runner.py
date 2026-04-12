@@ -20,6 +20,24 @@ Using z ~ N(0,I) as start vectors causes:
 
 Fix: always sample from N(x_mean, diag(x_std²)) — the training distribution.
 
+Coordinate-frame fix (Rg pipeline)
+-----------------------------------
+The decoder outputs shape (1, 8, 3) — 8 skeleton anchor points in Å,
+not a full residue chain.  gyr_pred.py is called AFTER decode and now
+filters to CA-only atoms so that Rg is computed in the correct frame.
+
+Gradient flow fix
+-----------------
+For gradient ascent, the score call must NOT be wrapped in torch.no_grad()
+so that rg.backward() (or score.backward()) can propagate gradients back
+through the oracle into z.
+
+TESS double warm-start fix
+--------------------------
+run_tess() handles its own internal warm_start (gradient-ascent
+pre-conditioning). experiment_runner must NOT run a separate GA warm-start
+before calling run_tess — that would double-condition the starting point.
+
 Temperature guidance
 --------------------
 With start vectors now in the correct region, score at z_start ≈ intercept.
@@ -27,6 +45,7 @@ Rule of thumb: T ≈ (intercept - target)^2 / 4
   target=5  Å → T ≈ (26.8-5)^2/4  ≈ 119  → use --temperature 120
   target=20 Å → T ≈ (26.8-20)^2/4 ≈  12  → use --temperature 12
   target=30 Å → T ≈ (30-26.8)^2/4 ≈   3  → use --temperature 3
+Training-set Rg range (10th–90th pct): 14.7 Å – 72.2 Å
 """
 
 from __future__ import annotations
@@ -57,7 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-tm",
         type=float,
         default=65.0,
-        help="Target scalar value to optimize towards",
+        help="Target Rg value to optimize towards (Å). "
+             "Training-set 10th–90th pct range: 14.7–72.2 Å.",
     )
     parser.add_argument(
         "--temperature",
@@ -100,300 +120,358 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help=(
-            "Warm-start ESS/TESS: run 20 gradient-ascent steps before the MCMC "
-            "chain so the starting point is already in a moderate-score region."
+            "Warm-start ESS/TESS: run 20 gradient-ascent steps before sampling. "
+            "For TESS, warm_start is handled internally by run_tess(); "
+            "this flag only affects the standalone ESS run."
         ),
     )
     parser.add_argument(
-        "--no-ess-warm-start",
-        dest="ess_warm_start",
-        action="store_false",
-        help="Disable ESS/TESS warm start (start MCMC from raw z_start)",
+        "--ess-warm-steps",
+        type=int,
+        default=20,
+        help="Number of gradient-ascent warm-start steps before ESS",
     )
-    # TESS-specific arguments
+    parser.add_argument(
+        "--ess-warm-lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for ESS gradient-ascent warm-start",
+    )
+    # TESS options
     parser.add_argument(
         "--tess-n-transforms",
         type=int,
         default=2,
-        help="Number of G-D coupling layer pairs in the TESS normalizing flow",
+        help="Number of G-D coupling layer pairs in the normalizing flow",
     )
     parser.add_argument(
         "--tess-d-hidden",
         type=int,
         default=32,
-        help="Hidden layer width for TESS coupling networks",
+        help="Hidden width of coupling MLP networks",
     )
     parser.add_argument(
         "--tess-warmup-epochs",
         type=int,
         default=3,
-        help="Number of TESS warm-up epochs h",
+        help="Number of warm-up epochs h (Algorithm 2, Cabezas & Nemeth 2023)",
     )
     parser.add_argument(
         "--tess-warmup-chains",
         type=int,
         default=10,
-        help="TESS warm-up chains k per epoch",
+        help="Chains k per warm-up epoch",
     )
     parser.add_argument(
         "--tess-m-grad-steps",
         type=int,
         default=10,
-        help="Adam steps m per TESS NF update",
+        help="Adam steps m per normalizing flow update",
     )
     parser.add_argument(
         "--tess-flow-lr",
         type=float,
         default=1e-3,
-        help="Adam learning rate for TESS NF training",
+        help="Learning rate for normalizing flow Adam optimizer",
     )
     parser.add_argument(
         "--skip-tess",
         action="store_true",
-        help="Skip TESS (run only gradient ascent and ESS)",
+        default=False,
+        help="Skip TESS (run GA + ESS only)",
     )
+    # Output
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("optimization/outputs"),
-        help="Directory to save trajectories and optimized vectors",
+        default=Path("runner/results/optimization"),
+        help="Directory to save z tensors and stats JSON",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
-        "--retrain-oracle",
-        action="store_true",
-        help=(
-            "Generate oracle retraining data: sample 500 z vectors from the "
-            "training prior N(x_mean, x_std^2), evaluate oracle-predicted Rg "
-            "for each, and save retrain_oracle_data.npz to --output-dir. "
-            "Use this data to retrain the ridge oracle on the actual decoder domain."
-        ),
+        help="Random seed",
     )
     return parser
 
 
-def _warm_start_z(
-    z_start: torch.Tensor,
-    target_fn,
-    warm_steps: int = 20,
-    lr: float = 0.1,
-) -> torch.Tensor:
-    """
-    Run a short gradient ascent (no penalty) to move z_start into a
-    region of non-trivial score before starting the MCMC chain.
-    """
-    z = z_start.clone().detach().requires_grad_(True)
-    opt = torch.optim.Adam([z], lr=lr)
-    for _ in range(warm_steps):
-        opt.zero_grad()
-        loss = -target_fn(z).log_likelihood
-        loss.backward()
-        opt.step()
-    return z.detach()
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def _load_prior_params(checkpoint_path: Path):
-    """Load x_mean and x_std from oracle checkpoint for training-prior sampling."""
-    with np.load(checkpoint_path) as d:
-        x_mean = torch.tensor(d["x_mean"], dtype=torch.float32)
-        x_std  = torch.tensor(d["x_std"],  dtype=torch.float32)
-        intercept = float(d["intercept"].flat[0])
-        coef = d["coef"]
-    return x_mean, x_std, intercept, coef
-
-
-def _sample_from_training_prior(
+def sample_start_vectors(
     n: int,
-    x_mean: torch.Tensor,
-    x_std: torch.Tensor,
-    seed: Optional[int] = None,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    device: torch.device,
 ) -> torch.Tensor:
-    """
-    Sample n vectors from the training distribution N(x_mean, diag(x_std^2)).
+    """Sample start vectors from the training prior N(x_mean, diag(x_std²)).
 
-    CRITICAL: Do NOT use torch.randn(n, d) — that samples from N(0,I) which is
-    3-6σ away from the oracle's training domain in every dimension.
-    The decoder maps N(0,I) inputs to degenerate proteins with Rg ≈ 3-5 Å.
+    Using N(0,I) places vectors 3-6σ outside the oracle's training domain,
+    causing degenerate decoder outputs and meaningless Rg values.
     """
-    if seed is not None:
-        torch.manual_seed(seed)
-    eps = torch.randn(n, len(x_mean))
-    return x_mean.unsqueeze(0) + eps * x_std.unsqueeze(0)
+    mean_t = torch.from_numpy(x_mean).float().to(device)
+    std_t  = torch.from_numpy(x_std).float().to(device)
+    eps    = torch.randn(n, len(x_mean), device=device)
+    return mean_t.unsqueeze(0) + eps * std_t.unsqueeze(0)
 
+
+# ---------------------------------------------------------------------------
+# Gradient Ascent
+# ---------------------------------------------------------------------------
+
+def run_gradient_ascent(
+    z_starts: torch.Tensor,
+    target_fn,
+    n_steps: int = 50,
+    lr: float = 0.1,
+    penalty: float = 0.05,
+    x_mean: Optional[np.ndarray] = None,
+    x_std:  Optional[np.ndarray] = None,
+) -> torch.Tensor:
+    """Gradient ascent on the oracle log-likelihood.
+
+    Gradient-flow fix
+    -----------------
+    The oracle call must NOT be inside torch.no_grad() — the gradient
+    must flow back from log_likelihood through the oracle into z so
+    that z.grad is populated on every step.
+
+    Args:
+        z_starts: Starting latent vectors [N, d]
+        target_fn: TargetFunction (oracle)
+        n_steps: Optimization steps
+        lr: Adam learning rate
+        penalty: L2 regularisation weight towards x_mean
+        x_mean: Training-prior mean for L2 anchor (optional)
+        x_std:  Training-prior std  (unused here, for API parity)
+
+    Returns:
+        z_final: Optimised latent vectors [N, d]
+    """
+    device   = z_starts.device
+    z_final  = []
+    mean_anchor = (
+        torch.from_numpy(x_mean).float().to(device)
+        if x_mean is not None else None
+    )
+
+    for i, z0 in enumerate(z_starts):
+        z = z0.clone().detach().requires_grad_(True)
+        opt = torch.optim.Adam([z], lr=lr)
+
+        for step in range(n_steps):
+            opt.zero_grad()
+            # NOTE: no torch.no_grad() here — gradients must flow through oracle
+            out   = target_fn(z)
+            score = out.log_likelihood
+
+            # L2 regularisation: penalise drift from training prior
+            l2_penalty = torch.tensor(0.0, device=device)
+            if mean_anchor is not None and penalty > 0.0:
+                l2_penalty = penalty * ((z - mean_anchor) ** 2).sum()
+
+            loss = -(score - l2_penalty)
+            loss.backward()
+            opt.step()
+
+        z_final.append(z.detach())
+
+        if (i + 1) % max(1, len(z_starts) // 10) == 0 or i == 0:
+            final_score = target_fn(z.detach()).pred_value.item()
+            print(
+                f"  [GA] Vector {i+1:4d}/{len(z_starts)} | "
+                f"pred={final_score:7.3f} | ||z||={z.detach().norm().item():.3f}"
+            )
+
+    return torch.stack(z_final)
+
+
+# ---------------------------------------------------------------------------
+# ESS
+# ---------------------------------------------------------------------------
+
+def run_ess(
+    z_starts: torch.Tensor,
+    target_fn,
+    n_steps: int = 50,
+    warm_start: bool = True,
+    warm_steps: int = 20,
+    warm_lr: float = 0.1,
+    x_mean: Optional[np.ndarray] = None,
+    x_std:  Optional[np.ndarray] = None,
+) -> torch.Tensor:
+    """Elliptical Slice Sampling (Murray, Adams & MacKay 2010).
+
+    Training-prior fix: auxiliary variable v is drawn from N(x_mean, diag(x_std²))
+    so that ellipse proposals stay in the decoder's valid input domain.
+    """
+    import math
+
+    device  = z_starts.device
+    z_final = []
+    mean_t  = torch.from_numpy(x_mean).float().to(device) if x_mean is not None else None
+    std_t   = torch.from_numpy(x_std).float().to(device)  if x_std  is not None else None
+
+    def log_score(z: torch.Tensor) -> float:
+        with torch.no_grad():
+            return target_fn(z).log_likelihood.item()
+
+    def _ess_step(z: torch.Tensor) -> torch.Tensor:
+        current = log_score(z)
+        log_s   = current + math.log(random.uniform(0, 1) + 1e-300)
+
+        eps = torch.randn_like(z)
+        v   = (mean_t + eps * std_t) if (mean_t is not None) else eps
+
+        theta     = random.uniform(0, 2 * math.pi)
+        theta_min = theta - 2 * math.pi
+        theta_max = theta
+
+        for _ in range(100):
+            z_prime   = z * math.cos(theta) + v * math.sin(theta)
+            if log_score(z_prime) > log_s:
+                return z_prime
+            if theta > 0:
+                theta_max = theta
+            else:
+                theta_min = theta
+            theta = random.uniform(theta_min, theta_max)
+        return z
+
+    for i, z0 in enumerate(z_starts):
+        z = z0.clone().detach()
+
+        # Optional gradient-ascent warm-start
+        if warm_start:
+            z_ws = z.requires_grad_(True)
+            opt  = torch.optim.Adam([z_ws], lr=warm_lr)
+            for _ in range(warm_steps):
+                opt.zero_grad()
+                (-target_fn(z_ws).log_likelihood).backward()
+                opt.step()
+            z = z_ws.detach()
+
+        for _ in range(n_steps):
+            z = _ess_step(z)
+
+        z_final.append(z)
+
+        if (i + 1) % max(1, len(z_starts) // 10) == 0 or i == 0:
+            print(
+                f"  [ESS] Vector {i+1:4d}/{len(z_starts)} | "
+                f"pred={target_fn(z).pred_value.item():7.3f} | ||z||={z.norm().item():.3f}"
+            )
+
+    return torch.stack(z_final)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args   = parser.parse_args()
+    set_seed(args.seed)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
+    # Load oracle
     from optimization.target_function import TargetFunction
-    from optimization.gradient_ascent import run_gradient_ascent
-    from optimization.elliptical_slice_sampling import run_ess
-    from optimization.transport_ess import run_tess
-
-    if not args.checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-
-    print(f"Loading Oracle from {args.checkpoint}...")
     target_fn = TargetFunction.from_checkpoint(
         model_path=args.checkpoint,
         target_value=args.target_tm,
         temperature=args.temperature,
     )
-    latent_dim = target_fn.get_latent_dim()
+    target_fn = target_fn.to(device)
+    target_fn.eval()
 
-    # Load prior params from oracle checkpoint
-    x_mean, x_std, _intercept, _coef = _load_prior_params(args.checkpoint)
-    suggested_T = (_intercept - args.target_tm) ** 2 / 4
+    # Extract training-prior statistics from oracle checkpoint
+    with np.load(args.checkpoint) as npz:
+        x_mean = npz["x_mean"].astype(np.float32)
+        x_std  = npz["x_std"].astype(np.float32)
+        intercept = float(npz["intercept"].flat[0])
 
-    print(f"  Latent dimension:      {latent_dim}")
-    print(f"  Oracle intercept:      {_intercept:.2f} Å")
-    print(f"  Training prior mean:   {x_mean.numpy().round(4)}")
-    print(f"  Training prior std:    {x_std.numpy().round(4)}")
-    print(f"  Prior range (±3σ):     [{(x_mean - 3*x_std).numpy().round(2)}")
-    print(f"                          {(x_mean + 3*x_std).numpy().round(2)}]")
-    print(f"  z=0 distance from prior: {((torch.zeros(latent_dim) - x_mean) / x_std).abs().numpy().round(1)} σ")
-    print(f"  Target value:          {args.target_tm}")
-    print(f"  Temperature used:      {args.temperature}")
-    print(f"  Suggested T:           {suggested_T:.1f}")
-    if abs(args.temperature - suggested_T) / max(suggested_T, 1) > 2:
-        print(f"  [WARN] Temperature {args.temperature} differs significantly from "
-              f"suggested {suggested_T:.1f}. ESS/TESS mixing may be poor.")
-    if not args.skip_tess:
-        print(f"  TESS n_transforms={args.tess_n_transforms}, "
-              f"d_hidden={args.tess_d_hidden}, "
-              f"warmup_epochs={args.tess_warmup_epochs}")
-    print(f"  ESS/TESS warm_start:   {args.ess_warm_start}")
+    print(f"Oracle intercept (pred at x_mean): {intercept:.2f} Å")
+    print(f"Training-set Rg range (10–90 pct): 14.7 – 72.2 Å")
+    print(f"Target Rg: {args.target_tm:.1f} Å")
+
+    # Sample starting vectors from training prior (not N(0,I))
+    z_starts = sample_start_vectors(args.n_vectors, x_mean, x_std, device)
+    print(f"Sampled {args.n_vectors} start vectors from N(x_mean, diag(x_std²))")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    stats: dict = {"target_tm": args.target_tm, "temperature": args.temperature}
 
-    # ------------------------------------------------------------------
-    # Optional: generate oracle retraining data
-    # ------------------------------------------------------------------
-    if args.retrain_oracle:
-        print("\n" + "=" * 60)
-        print("GENERATING ORACLE RETRAINING DATA")
-        print("=" * 60)
-        n_retrain = 500
-        print(f"  Sampling {n_retrain} z vectors from training prior N(x_mean, x_std²)...")
-        z_retrain = _sample_from_training_prior(n_retrain, x_mean, x_std, seed=args.seed)
-        pred_rgs = []
-        with torch.no_grad():
-            for j in range(n_retrain):
-                out = target_fn(z_retrain[j])
-                pred_rgs.append(out.pred_value.item())
-        pred_rgs = np.array(pred_rgs)
-        out_npz = args.output_dir / "retrain_oracle_data.npz"
-        np.savez(
-            out_npz,
-            z=z_retrain.numpy(),
-            pred_rg=pred_rgs,
-            x_mean=x_mean.numpy(),
-            x_std=x_std.numpy(),
-        )
-        print(f"  Oracle-predicted Rg: {pred_rgs.mean():.2f} ± {pred_rgs.std():.2f} Å  "
-              f"[{pred_rgs.min():.2f}, {pred_rgs.max():.2f}]")
-        print(f"  Saved: {out_npz}")
-        print("")
-        print("  NEXT STEP: decode these z vectors to PDB, measure actual Rg,")
-        print("  then retrain ridge on (z → actual_Rg) using regression/train_oracle.py")
-        print("="*60 + "\n")
+    # ── Gradient Ascent ──────────────────────────────────────────────────
+    print("\n[1/3] Gradient Ascent")
+    z_ga = run_gradient_ascent(
+        z_starts,
+        target_fn,
+        n_steps=args.n_steps,
+        lr=args.gradient_lr,
+        penalty=args.gradient_penalty,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+    torch.save(z_ga, args.output_dir / "z_final_gradient_ascent.pt")
 
-    # ------------------------------------------------------------------
-    # Generate start vectors from TRAINING PRIOR, not N(0,I)
-    # ------------------------------------------------------------------
-    print(f"\nGenerating {args.n_vectors} start vectors from training prior "
-          f"N(x_mean, x_std²)...")
-    start_vectors = _sample_from_training_prior(args.n_vectors, x_mean, x_std, seed=args.seed)
-
-    # Sanity check: oracle should predict ~intercept ± a few Å
     with torch.no_grad():
-        sample_preds = [target_fn(start_vectors[j]).pred_value.item()
-                        for j in range(min(20, args.n_vectors))]
-    sample_preds = np.array(sample_preds)
-    print(f"  Oracle-predicted Rg at start vectors: "
-          f"{sample_preds.mean():.2f} ± {sample_preds.std():.2f} Å  "
-          f"[{sample_preds.min():.2f}, {sample_preds.max():.2f}]")
-    print(f"  (Should be ≈ {_intercept:.1f} ± a few Å — if wildly off, retrain oracle)")
-
-    all_trajectories = {
-        "vector_id": [],
-        "step": [],
-        "method": [],
-        "log_score": [],
+        preds_ga = target_fn(z_ga).pred_value.cpu().numpy()
+    stats["gradient_ascent"] = {
+        "mean": float(preds_ga.mean()),
+        "max":  float(preds_ga.max()),
+        "std":  float(preds_ga.std()),
+        "improvement_mean": float((preds_ga - intercept).mean()),
     }
+    print(f"  GA   pred: mean={preds_ga.mean():.2f}  max={preds_ga.max():.2f}  std={preds_ga.std():.2f}")
 
-    z_final_gradient = torch.zeros(args.n_vectors, latent_dim)
-    z_final_ess      = torch.zeros(args.n_vectors, latent_dim)
-    z_final_tess     = torch.zeros(args.n_vectors, latent_dim)
+    # ── ESS ──────────────────────────────────────────────────────────────
+    print("\n[2/3] ESS")
+    z_ess = run_ess(
+        z_starts,
+        target_fn,
+        n_steps=args.n_steps,
+        warm_start=args.ess_warm_start,
+        warm_steps=args.ess_warm_steps,
+        warm_lr=args.ess_warm_lr,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+    torch.save(z_ess, args.output_dir / "z_final_ess.pt")
 
-    initial_scores        = []
-    final_scores_gradient = []
-    final_scores_ess      = []
-    final_scores_tess     = []
+    with torch.no_grad():
+        preds_ess = target_fn(z_ess).pred_value.cpu().numpy()
+    stats["ess"] = {
+        "mean": float(preds_ess.mean()),
+        "max":  float(preds_ess.max()),
+        "std":  float(preds_ess.std()),
+        "improvement_mean": float((preds_ess - intercept).mean()),
+    }
+    print(f"  ESS  pred: mean={preds_ess.mean():.2f}  max={preds_ess.max():.2f}  std={preds_ess.std():.2f}")
 
-    methods = ["gradient_ascent", "ess"] + ([] if args.skip_tess else ["tess"])
-    print(f"\nRunning {', '.join(methods)} on {args.n_vectors} vectors "
-          f"({args.n_steps} steps each)...\n")
+    # ── TESS ─────────────────────────────────────────────────────────────
+    if not args.skip_tess:
+        print("\n[3/3] TESS")
+        from optimization.transport_ess import run_tess
 
-    for i in range(args.n_vectors):
-        z_start = start_vectors[i]
+        x_mean_t = torch.from_numpy(x_mean).to(device)
+        x_std_t  = torch.from_numpy(x_std).to(device)
 
-        with torch.no_grad():
-            output = target_fn(z_start)
-            initial_log_score = output.log_likelihood.item()
-            initial_scores.append(initial_log_score)
-
-        print(f"Vector {i + 1}/{args.n_vectors}")
-        print(f"  Initial log_score: {initial_log_score:.4f}  "
-              f"(pred_rg={output.pred_value.item():.2f} Å)")
-
-        # Warm-start for MCMC methods
-        if args.ess_warm_start:
-            z_mcmc_start = _warm_start_z(z_start, target_fn)
-            with torch.no_grad():
-                ws_out = target_fn(z_mcmc_start)
-            print(f"  Warm-start log_score: {ws_out.log_likelihood.item():.4f}  "
-                  f"(pred_rg={ws_out.pred_value.item():.2f} Å)")
-        else:
-            z_mcmc_start = z_start
-
-        # ── Gradient Ascent ────────────────────────────────────────────
-        print(f"  → Running Gradient Ascent...")
-        z_final_ga, traj_ga = run_gradient_ascent(
-            z_start=z_start,
-            target_fn=target_fn,
-            steps=args.n_steps,
-            lr=args.gradient_lr,
-            penalty_weight=args.gradient_penalty,
-        )
-        z_final_gradient[i] = z_final_ga
-        final_scores_gradient.append(traj_ga[-1])
-
-        # ── ESS ────────────────────────────────────────────────────────
-        print(f"  → Running ESS...")
-        z_final_ess_iter, traj_ess = run_ess(
-            z_start=z_mcmc_start,
-            target_fn=target_fn,
-            steps=args.n_steps,
-            x_mean=x_mean,
-            x_std=x_std,
-        )
-        z_final_ess[i] = z_final_ess_iter
-        final_scores_ess.append(traj_ess[-1])
-
-        # ── TESS ───────────────────────────────────────────────────────
-        if not args.skip_tess:
-            print(f"  → Running TESS...")
-            z_final_tess_iter, traj_tess = run_tess(
-                z_start=z_mcmc_start,
+        z_tess_list = []
+        for i, z0 in enumerate(z_starts):
+            # NOTE: do NOT run a GA warm-start here.
+            # run_tess() calls its own internal warm_start when warm_start=True.
+            # Double warm-starting corrupts the starting point.
+            z_final_i, _ = run_tess(
+                z_start=z0,
                 target_fn=target_fn,
                 steps=args.n_steps,
                 n_transforms=args.tess_n_transforms,
@@ -402,145 +480,55 @@ def main() -> None:
                 warmup_chains=args.tess_warmup_chains,
                 m_grad_steps=args.tess_m_grad_steps,
                 flow_lr=args.tess_flow_lr,
-                x_mean=x_mean,
-                x_std=x_std,
+                warm_start=args.ess_warm_start,
+                warm_steps=args.ess_warm_steps,
+                warm_lr=args.ess_warm_lr,
+                x_mean=x_mean_t,
+                x_std=x_std_t,
             )
-            z_final_tess[i] = z_final_tess_iter
-            final_scores_tess.append(traj_tess[-1])
+            z_tess_list.append(z_final_i)
 
-        print(f"  Results:")
+            if (i + 1) % max(1, args.n_vectors // 10) == 0 or i == 0:
+                pred_i = target_fn(z_final_i).pred_value.item()
+                print(
+                    f"  [TESS] Vector {i+1:4d}/{args.n_vectors} | "
+                    f"pred={pred_i:7.3f} | ||z||={z_final_i.norm().item():.3f}"
+                )
+
+        z_tess = torch.stack(z_tess_list)
+        torch.save(z_tess, args.output_dir / "z_final_tess.pt")
+
         with torch.no_grad():
-            ga_pred  = target_fn(z_final_ga).pred_value.item()
-            ess_pred = target_fn(z_final_ess_iter).pred_value.item()
-        print(f"    Gradient Ascent: score={traj_ga[-1]:.4f}  pred_rg={ga_pred:.2f} Å  "
-              f"(Δ={traj_ga[-1] - initial_log_score:+.4f})")
-        print(f"    ESS:             score={traj_ess[-1]:.4f}  pred_rg={ess_pred:.2f} Å  "
-              f"(Δ={traj_ess[-1] - initial_log_score:+.4f})")
-        if not args.skip_tess:
-            with torch.no_grad():
-                tess_pred = target_fn(z_final_tess_iter).pred_value.item()
-            print(f"    TESS:            score={traj_tess[-1]:.4f}  pred_rg={tess_pred:.2f} Å  "
-                  f"(Δ={traj_tess[-1] - initial_log_score:+.4f})")
-        print()
-
-        for step, score_ga in enumerate(traj_ga):
-            all_trajectories["vector_id"].append(i)
-            all_trajectories["step"].append(step)
-            all_trajectories["method"].append("gradient_ascent")
-            all_trajectories["log_score"].append(score_ga)
-
-        for step, score_ess in enumerate(traj_ess):
-            all_trajectories["vector_id"].append(i)
-            all_trajectories["step"].append(step)
-            all_trajectories["method"].append("ess")
-            all_trajectories["log_score"].append(score_ess)
-
-        if not args.skip_tess:
-            for step, score_tess in enumerate(traj_tess):
-                all_trajectories["vector_id"].append(i)
-                all_trajectories["step"].append(step)
-                all_trajectories["method"].append("tess")
-                all_trajectories["log_score"].append(score_tess)
-
-    # Save trajectories
-    traj_df = pd.DataFrame(all_trajectories)
-    traj_csv = args.output_dir / "trajectories.csv"
-    traj_df.to_csv(traj_csv, index=False)
-    print(f"\n✓ Saved trajectories: {traj_csv}")
-
-    # Save optimized vectors
-    torch.save(z_final_gradient, args.output_dir / "z_final_gradient_ascent.pt")
-    torch.save(z_final_ess,      args.output_dir / "z_final_ess.pt")
-    if not args.skip_tess:
-        torch.save(z_final_tess, args.output_dir / "z_final_tess.pt")
-    print(f"✓ Saved optimized vectors in {args.output_dir}")
-
-    # Compute statistics
-    def _stats(scores_final, scores_initial, z_finals):
-        arr_f = np.array(scores_final)
-        arr_i = np.array(scores_initial)
-        with torch.no_grad():
-            preds = np.array([target_fn(z_finals[j]).pred_value.item()
-                              for j in range(len(z_finals))])
-        return {
-            "initial_mean_log_score":  float(np.mean(arr_i)),
-            "final_mean_log_score":    float(np.mean(arr_f)),
-            "final_max_log_score":     float(np.max(arr_f)),
-            "final_min_log_score":     float(np.min(arr_f)),
-            "final_std_log_score":     float(np.std(arr_f)),
-            "mean_improvement":        float(np.mean(arr_f - arr_i)),
-            "pred_rg_mean":            float(np.mean(preds)),
-            "pred_rg_std":             float(np.std(preds)),
-            "pred_rg_min":             float(np.min(preds)),
-            "pred_rg_max":             float(np.max(preds)),
+            preds_tess = target_fn(z_tess).pred_value.cpu().numpy()
+        stats["tess"] = {
+            "mean": float(preds_tess.mean()),
+            "max":  float(preds_tess.max()),
+            "std":  float(preds_tess.std()),
+            "improvement_mean": float((preds_tess - intercept).mean()),
         }
+        print(f"  TESS pred: mean={preds_tess.mean():.2f}  max={preds_tess.max():.2f}  std={preds_tess.std():.2f}")
+    else:
+        print("\n[3/3] TESS — skipped (--skip-tess)")
 
-    stats = {
-        "n_vectors":   args.n_vectors,
-        "n_steps":     args.n_steps,
-        "latent_dim":  latent_dim,
-        "target_tm":   args.target_tm,
-        "temperature": args.temperature,
-        "seed":        args.seed,
-        "oracle_intercept": _intercept,
-        "gradient_ascent": _stats(final_scores_gradient, initial_scores, z_final_gradient),
-        "ess":             _stats(final_scores_ess,      initial_scores, z_final_ess),
-    }
-    if not args.skip_tess:
-        stats["tess"] = _stats(final_scores_tess, initial_scores, z_final_tess)
+    # ── Summary ──────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print(f"  Target Rg:  {args.target_tm:.1f} Å")
+    methods = [k for k in ("gradient_ascent", "ess", "tess") if k in stats]
+    for m in methods:
+        s = stats[m]
+        print(
+            f"  {m:17s}: mean={s['mean']:7.2f}  max={s['max']:7.2f}  "
+            f"std={s['std']:6.2f}  Δmean={s['improvement_mean']:+.2f}"
+        )
+    if methods:
+        winner = max(methods, key=lambda m: stats[m]["max"])
+        print(f"  Winner (by max pred): {winner}")
+    print("=" * 60)
 
-    stats_json = args.output_dir / "optimization_stats.json"
-    stats_json.write_text(json.dumps(stats, indent=2))
-    print(f"✓ Saved statistics: {stats_json}")
-
-    # Summary
-    print("\n" + "=" * 70)
-    print("OPTIMIZATION SUMMARY")
-    print("=" * 70)
-
-    def _print_method(name, s):
-        print(f"\n{name}:")
-        print(f"  Mean initial score:   {s['initial_mean_log_score']:8.4f}")
-        print(f"  Mean final score:     {s['final_mean_log_score']:8.4f}")
-        print(f"  Mean improvement:     {s['mean_improvement']:+8.4f}")
-        print(f"  Best score:           {s['final_max_log_score']:8.4f}")
-        print(f"  Score std:            {s['final_std_log_score']:8.4f}")
-        print(f"  Pred Rg mean ± std:   {s['pred_rg_mean']:.2f} ± {s['pred_rg_std']:.2f} Å  "
-              f"[{s['pred_rg_min']:.2f}, {s['pred_rg_max']:.2f}]")
-
-    _print_method("Gradient Ascent", stats["gradient_ascent"])
-    _print_method("Elliptical Slice Sampling (ESS)", stats["ess"])
-    if not args.skip_tess:
-        _print_method("Transport ESS (TESS)", stats["tess"])
-
-    # Determine winner
-    candidates = {
-        "Gradient Ascent": stats["gradient_ascent"]["mean_improvement"],
-        "ESS":             stats["ess"]["mean_improvement"],
-    }
-    if not args.skip_tess:
-        candidates["TESS"] = stats["tess"]["mean_improvement"]
-    winner = max(candidates, key=candidates.get)
-    print(f"\n\U0001f3c6 Winner (by mean improvement): {winner}")
-
-    print("\n" + "=" * 70)
-    print("NEXT STEPS: Validation Pipeline")
-    print("=" * 70)
-    print(f"""
-Run the Rg pipeline with the correct temperature:
-  $ bash runner/run_rg_pipeline.sh {args.target_tm} {args.n_vectors} \\
-        {args.n_steps} {args.temperature}
-
-To generate oracle retraining data (recommended):
-  $ python -m optimization.experiment_runner \\
-      --checkpoint {args.checkpoint} \\
-      --target-tm {args.target_tm} \\
-      --n-vectors 1 --n-steps 1 \\
-      --retrain-oracle \\
-      --output-dir {args.output_dir}
-  Then decode retrain_oracle_data.npz z-vectors to PDB,
-  measure actual Rg, and retrain with regression/train_oracle.py
-""")
+    stats_path = args.output_dir / "stats.json"
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Stats saved → {stats_path}")
 
 
 if __name__ == "__main__":

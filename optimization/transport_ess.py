@@ -15,6 +15,17 @@ this is equivalent to drawing from N(0,I) in z-space, which is 3-6σ OOD.
 Fix: pass x_mean/x_std to run_tess; v is drawn from N(x_mean, diag(x_std^2))
 in _one_tess_step so that all proposals stay in the oracle's training domain.
 
+Critical fix: _train_flow reference prior
+-----------------------------------------
+The NF training loss uses log p_u(T^{-1}(x)), where p_u is the reference
+distribution for the transport map.  The original code used N(0,I) as the
+reference, but the training-domain prior is N(x_mean, diag(x_std^2)).
+Using N(0,I) teaches the NF to push mass towards z=0, which is 3-6σ OOD.
+
+Fix: when x_mean/x_std are supplied, log_p_u is computed under
+N(x_mean, diag(x_std^2)) so the NF learns a transport towards the correct
+training distribution.
+
 References:
   - Cabezas & Nemeth, AISTATS 2023, arXiv:2210.10644v2
   - Murray, Adams, MacKay. Elliptical Slice Sampling. ICML 2010.
@@ -173,7 +184,7 @@ def _one_tess_step(
 
     # Draw auxiliary variable from training prior
     eps = torch.randn_like(u)
-    if x_mean is not None:
+    if x_mean is not None and x_std is not None:
         v = x_mean.to(u.device) + eps * x_std.to(u.device)
     else:
         v = eps  # fallback N(0,I)
@@ -204,9 +215,21 @@ def _train_flow(
     target_fn,
     m_steps: int = 10,
     lr: float = 1e-3,
+    x_mean: Optional[torch.Tensor] = None,
+    x_std:  Optional[torch.Tensor] = None,
 ) -> None:
     """
     Minimise forward KL: L(φ) = -1/k Σ_i [log p_u(T^{-1}(x_i)) + log |det J_{T^{-1}}(x_i)|]
+
+    Training-prior fix
+    ------------------
+    The reference density p_u must match the auxiliary-variable distribution
+    used in _one_tess_step.  If x_mean/x_std are provided we use
+    p_u = N(x_mean, diag(x_std^2)); otherwise fall back to N(0,I).
+
+    Using N(0,I) when the training prior is N(x_mean, x_std^2) causes the NF
+    to learn a transform that pushes u towards zero — which is 3-6σ OOD and
+    produces degenerate proposals in subsequent TESS steps.
     """
     optimizer = optim.Adam(flow.parameters(), lr=lr)
     flow.train()
@@ -216,7 +239,23 @@ def _train_flow(
         u_batch, log_det_inv = flow.inverse(samples_x)
         log_det_inv = torch.clamp(log_det_inv, -50.0, 50.0)
         d = u_batch.shape[-1]
-        log_p_u = -0.5 * (u_batch ** 2).sum(-1) - 0.5 * d * math.log(2 * math.pi)
+
+        if x_mean is not None and x_std is not None:
+            # log N(u; x_mean, diag(x_std^2))
+            mean = x_mean.to(u_batch.device)
+            std  = x_std.to(u_batch.device)
+            log_p_u = (
+                -0.5 * ((u_batch - mean) / std) ** 2
+                - torch.log(std)
+                - 0.5 * math.log(2 * math.pi)
+            ).sum(dim=-1)
+        else:
+            # fallback: log N(u; 0, I)
+            log_p_u = (
+                -0.5 * (u_batch ** 2).sum(-1)
+                - 0.5 * d * math.log(2 * math.pi)
+            )
+
         loss = -(log_p_u + log_det_inv).mean()
         loss.backward()
         nn.utils.clip_grad_norm_(flow.parameters(), max_norm=5.0)
@@ -246,9 +285,16 @@ def run_tess(
 
     Training-prior fix
     ------------------
-    Pass x_mean and x_std (from the oracle .npz) so that ellipse auxiliary
-    variables in _one_tess_step are drawn from N(x_mean, diag(x_std^2)).
-    This keeps proposals within the decoder's valid input domain.
+    Pass x_mean and x_std (from the oracle .npz) so that:
+      1. Ellipse auxiliary variables in _one_tess_step are drawn from
+         N(x_mean, diag(x_std^2)) — keeps proposals in decoder's valid domain.
+      2. _train_flow uses N(x_mean, diag(x_std^2)) as the reference prior —
+         the NF learns to transport towards the training distribution, not N(0,I).
+
+    Double warm-start fix
+    ---------------------
+    run_tess() handles its own gradient-ascent warm_start internally.
+    experiment_runner must NOT run a separate GA pass before calling run_tess().
 
     Args:
         z_start:        Initial latent vector [latent_dim]
@@ -293,7 +339,7 @@ def run_tess(
     u = u_batch.squeeze(0).detach()
 
     # -------------------------------------------------------------------
-    # PHASE 1: Warm-up
+    # PHASE 1: Warm-up  (Algorithm 2, steps 1-6)
     # -------------------------------------------------------------------
     print(f"  [TESS] Warm-up: {warmup_epochs} epochs × {warmup_chains} chains")
     for epoch in range(warmup_epochs):
@@ -309,7 +355,12 @@ def run_tess(
             warmup_x_list.append(x_batch.squeeze(0).detach())
         warmup_x = torch.stack(warmup_x_list, dim=0)
 
-        _train_flow(flow, warmup_x, target_fn, m_steps=m_grad_steps, lr=flow_lr)
+        # Pass x_mean/x_std so NF trains towards the correct reference prior
+        _train_flow(
+            flow, warmup_x, target_fn,
+            m_steps=m_grad_steps, lr=flow_lr,
+            x_mean=x_mean, x_std=x_std,
+        )
 
         with torch.no_grad():
             x_cur_batch, _ = flow(u.unsqueeze(0))
@@ -319,7 +370,7 @@ def run_tess(
         print(f"  [TESS]  Warm-up epoch {epoch + 1}/{warmup_epochs} done")
 
     # -------------------------------------------------------------------
-    # PHASE 2: Sampling
+    # PHASE 2: Sampling  (Algorithm 2, step 7)
     # -------------------------------------------------------------------
     trajectory: List[float] = []
     print(f"  [TESS] Sampling phase: {steps} steps")
