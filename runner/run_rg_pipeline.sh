@@ -11,6 +11,21 @@
 #   target=30 Å → T ≈   3
 #   target=50 Å → T ≈ 134  (target > intercept, same formula)
 #
+# Decoder coordinate rescaling
+# ----------------------------
+# The ProteinAE decoder outputs 8 CA skeleton points in a normalised
+# coordinate frame (range ≈ [-2, 2], raw Rg ≈ 0.4–1.6).  gyr_pred.py
+# is called with --decoded so it multiplies by DECODER_SCALE_FACTOR (28.56)
+# to convert to physical Angstroms.  The scale factor is derived from the
+# 3NIH roundtrip: native Rg = 11.425 Å, decoded raw Rg ≈ 0.400 Å.
+#
+# To re-derive the scale factor:
+#   python protein-verification/calibrate_decoder_scale.py \
+#       --reference-pdb runner/data/3NIH.pdb \
+#       --ae-checkpoint /path/to/ae_r1_d8_v1.ckpt
+# or (without running encode/decode):
+#   python protein-verification/calibrate_decoder_scale.py --skip-roundtrip
+#
 # Environment overrides (optional):
 #   DATA_DIR          – where downloaded PDBs live   (default: runner/data)
 #   RESULTS_DIR       – where results are written    (default: runner/results)
@@ -18,12 +33,6 @@
 #   AE_CHECKPOINT     – autoencoder .ckpt path       (auto-detected from model-checkpoints/)
 #   AUTOENCODE_ACCELERATOR – gpu | cpu               (default: gpu)
 #   GPU_LIST          – comma-separated GPU ids      (auto-detected)
-#
-# Pipeline (per target Tm):
-#   1. Run experiment_runner.py  → z_final_{ga,ess,tess}.pt
-#   2. Decode z tensors          → PDB files  (via proteinfoundation/autoencode.py)
-#   3. Compute Rg                → rg_{method}.npy
-#   4. Plot comparison           → runner/plots/
 
 set -euo pipefail
 
@@ -37,7 +46,6 @@ TARGET_TM="${1:-50}"
 N_VECTORS="${2:-100}"
 N_STEPS="${3:-50}"
 # Default temperature: (26.8 - TARGET_TM)^2 / 4, floored at 1
-# Shell arithmetic is integer-only; we use awk for the float calculation.
 _DEFAULT_T="$(awk -v t="$TARGET_TM" 'BEGIN { v=(26.8-t)^2/4; print (v<1)?1:v }' 2>/dev/null || echo 100)"
 TEMPERATURE="${4:-${_DEFAULT_T}}"
 
@@ -74,6 +82,14 @@ fi
 mkdir -p "$MODEL_DIR/checkpoints"
 ln -sf "$AE_CHECKPOINT" "$MODEL_DIR/checkpoints/ae_r1_d8_v1.ckpt"
 echo "Using checkpoint: $AE_CHECKPOINT"
+
+# ── Auto-calibrate decoder scale if not yet done ──────────────────────────
+SCALE_FILE="$GPML_DIR/protein-verification/decoder_scale.txt"
+if [[ ! -f "$SCALE_FILE" ]]; then
+    echo "[calibrate] decoder_scale.txt not found — writing empirical scale (28.56)..."
+    python "$GPML_DIR/protein-verification/calibrate_decoder_scale.py" --skip-roundtrip
+fi
+echo "Decoder scale factor: $(cat "$SCALE_FILE")"
 
 # ── GPU resolution ────────────────────────────────────────────────────────
 if [[ "$AUTOENCODE_ACCELERATOR" == "cpu" ]]; then
@@ -172,13 +188,16 @@ flatten_generated_pdbs() {
     done
 }
 
-# ── Helper: run gyr_pred.py and save .npy alongside the CSV ──────────────
+# ── Helper: run gyr_pred.py with decoder rescaling ────────────────────────
+# All decoded PDBs are passed with --decoded so the raw Cα Rg (in normalised
+# [-2,2] units) is multiplied by DECODER_SCALE_FACTOR → physical Angstroms.
 compute_rg() {
     local pdb_dir="$1" label="$2" out_csv="$3" out_npy="$4"
     python "$GPML_DIR/protein-verification/gyr_pred.py" \
         --input_dir   "$pdb_dir" \
         --label       "$label" \
-        --output_csv  "$out_csv"
+        --output_csv  "$out_csv" \
+        --decoded
     python - "$out_csv" "$out_npy" <<'PY'
 import sys, numpy as np, pandas as pd
 df = pd.read_csv(sys.argv[1])
@@ -239,9 +258,9 @@ for METHOD in gradient_ascent ess tess; do
     echo "  → PDBs in $FLAT_DIR"
 done
 
-# ── Step 3: Compute Rg ────────────────────────────────────────────────────
+# ── Step 3: Compute Rg (with decoder rescaling) ───────────────────────────
 echo ""
-echo "[3/4] Computing Radius of Gyration..."
+echo "[3/4] Computing Radius of Gyration (decoded Cα ×$(cat $SCALE_FILE) → Å)..."
 
 for METHOD in gradient_ascent ess tess; do
     FLAT_DIR="$PDB_BASE/${METHOD}"
