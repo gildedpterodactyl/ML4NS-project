@@ -1,201 +1,263 @@
 #!/usr/bin/env python3
-"""Plot radius-of-gyration comparisons for feed-forward and generated proteins."""
+"""
+plot_rg_methods.py  –  Radius-of-Gyration comparison: GA vs ESS vs TESS
+
+Extends the original 2-method Rg plot to include TESS as the third method.
+Produces:
+  - Violin plot:     Rg distribution per method per target Tm
+  - Histogram:       Rg per method at a chosen target Tm
+  - Overlay:         All three methods vs downloaded reference
+  - Summary CSV:     mean / std / median Rg per method and target
+
+Usage:
+  python runner/plot_rg_methods.py \\
+      --results-dir runner/results \\
+      --plots-dir   runner/plots \\
+      --targets 20 50 70
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ── colour palette (consistent across all plots) ─────────────────────────
+METHOD_COLORS = {
+    "gradient_ascent": "#e07b54",   # warm orange
+    "ess":             "#4f98a3",   # teal
+    "tess":            "#7a39bb",   # purple  (new method)
+    "downloaded":      "#b0b0b0",   # grey reference
+}
+METHOD_LABELS = {
+    "gradient_ascent": "Gradient Ascent",
+    "ess":             "ESS",
+    "tess":            "TESS",
+    "downloaded":      "Reference (downloaded)",
+}
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Plot Rg comparisons across methods")
-    parser.add_argument(
-        "--validation-dir",
-        type=Path,
-        required=True,
-        help="Directory containing rg_*.csv files",
+def load_rg(results_dir: Path, target_tm: int, method: str) -> np.ndarray | None:
+    """
+    Load Rg values for a (target, method) pair.
+    Expected path:  results_dir/targets/target_{tm}/optimization/rg_{method}.npy
+    Falls back to checking for a CSV with a 'rg' column.
+    """
+    base = results_dir / "targets" / f"target_{target_tm}" / "optimization"
+    npy  = base / f"rg_{method}.npy"
+    csv  = base / f"rg_{method}.csv"
+    if npy.exists():
+        return np.load(npy)
+    if csv.exists():
+        return pd.read_csv(csv)["rg"].values
+    return None
+
+
+def load_reference_rg(results_dir: Path) -> np.ndarray | None:
+    for name in ("rg_downloaded.npy", "rg_reference.npy"):
+        p = results_dir / name
+        if p.exists():
+            return np.load(p)
+    for name in ("rg_downloaded.csv", "rg_reference.csv"):
+        p = results_dir / name
+        if p.exists():
+            return pd.read_csv(p)["rg"].values
+    return None
+
+
+def make_violin_plot(data_dict: dict, target_tm: int, out_path: Path) -> None:
+    """
+    Violin plot: Rg distribution for each method at a given Tm target.
+    data_dict = {method_name: np.ndarray_of_rg_values}
+    """
+    methods = [m for m in ["gradient_ascent", "ess", "tess"] if m in data_dict]
+    if not methods:
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    parts = ax.violinplot(
+        [data_dict[m] for m in methods],
+        positions=range(len(methods)),
+        showmedians=True,
+        showextrema=True,
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Directory where plots should be written",
-    )
-    parser.add_argument(
-        "--target-value",
-        type=float,
-        default=None,
-        help="Optional target Rg value for target-distance plots",
-    )
-    return parser
+    for pc, m in zip(parts["bodies"], methods):
+        pc.set_facecolor(METHOD_COLORS[m])
+        pc.set_alpha(0.75)
+    for key in ("cmedians", "cmins", "cmaxes", "cbars"):
+        if key in parts:
+            parts[key].set_color("#333333")
+
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=11)
+    ax.set_ylabel("Radius of Gyration (Å)", fontsize=11)
+    ax.set_title(f"Rg Distribution – Target Tm = {target_tm}°C", fontsize=13)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
 
 
-def load_series(path: Path, label: str) -> pd.Series:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing Rg CSV for {label}: {path}")
-    df = pd.read_csv(path)
-    if "rg" not in df.columns:
-        raise ValueError(f"Expected an 'rg' column in {path}")
-    return df["rg"].astype(float)
+def make_histogram(data_dict: dict, target_tm: int, out_path: Path) -> None:
+    """
+    Overlapping histograms (one per method) at a given Tm target.
+    """
+    methods = [m for m in ["gradient_ascent", "ess", "tess"] if m in data_dict]
+    if not methods:
+        return
 
+    fig, ax = plt.subplots(figsize=(7, 5))
+    all_vals = np.concatenate([data_dict[m] for m in methods])
+    bins = np.linspace(all_vals.min() * 0.95, all_vals.max() * 1.05, 40)
 
-def save_line_plot(series_map: dict[str, pd.Series], output_path: Path) -> None:
-    plt.figure(figsize=(12, 6))
-    for label, series in series_map.items():
-        x = np.arange(1, len(series) + 1)
-        plt.plot(x, series.to_numpy(), marker="o", markersize=3, linewidth=1.2, label=f"{label} (n={len(series)})")
-    plt.xlabel("Sample index")
-    plt.ylabel("Radius of gyration (Å)")
-    plt.title("Rg of all samples by method")
-    plt.legend()
-    plt.grid(True, alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-
-def save_distribution_plot(series_map: dict[str, pd.Series], output_path: Path) -> None:
-    plt.figure(figsize=(12, 6))
-    max_val = max(float(series.max()) for series in series_map.values())
-    min_val = min(float(series.min()) for series in series_map.values())
-    bins = np.linspace(min_val, max_val, 30)
-    for label, series in series_map.items():
-        plt.hist(series.to_numpy(), bins=bins, alpha=0.45, density=True, label=f"{label} (n={len(series)})")
-    plt.xlabel("Radius of gyration (Å)")
-    plt.ylabel("Density")
-    plt.title("Rg distribution by method")
-    plt.legend()
-    plt.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-
-def save_violin_plot(series_map: dict[str, pd.Series], output_path: Path) -> None:
-    labels = list(series_map.keys())
-    data = [series_map[label].to_numpy() for label in labels]
-    plt.figure(figsize=(10, 6))
-    parts = plt.violinplot(data, showmeans=True, showmedians=True, showextrema=True)
-    for body in parts["bodies"]:
-        body.set_facecolor("#8ecae6")
-        body.set_edgecolor("#3a7ca5")
-        body.set_alpha(0.8)
-    plt.xticks(range(1, len(labels) + 1), [f"{label}\n(n={len(series_map[label])})" for label in labels])
-    plt.ylabel("Radius of gyration (Å)")
-    plt.title("Rg violin plot by method")
-    plt.grid(True, axis="y", alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-
-def save_generated_only_violin(series_map: dict[str, pd.Series], output_path: Path) -> None:
-    labels = ["gradient_ascent", "slice_sampling"]
-    data = [series_map[label].to_numpy() for label in labels]
-
-    plt.figure(figsize=(9, 6))
-    parts = plt.violinplot(data, showmeans=True, showmedians=True, showextrema=True)
-    for body in parts["bodies"]:
-        body.set_facecolor("#bde0fe")
-        body.set_edgecolor("#1d3557")
-        body.set_alpha(0.85)
-
-    plt.xticks(range(1, len(labels) + 1), [f"{label}\n(n={len(series_map[label])})" for label in labels])
-    plt.ylabel("Radius of gyration (Å)")
-    plt.title("Generated-only Rg violin plot")
-    plt.grid(True, axis="y", alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-
-def save_target_distance_hist(series_map: dict[str, pd.Series], target_value: float, output_path: Path) -> pd.DataFrame:
-    gradient_dist = np.abs(series_map["gradient_ascent"].to_numpy() - target_value)
-    slice_dist = np.abs(series_map["slice_sampling"].to_numpy() - target_value)
-
-    max_dist = float(max(gradient_dist.max(initial=0.0), slice_dist.max(initial=0.0)))
-    bins = np.linspace(0.0, max_dist if max_dist > 0 else 1.0, 30)
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(gradient_dist, bins=bins, alpha=0.5, label=f"gradient_ascent (n={len(gradient_dist)})")
-    plt.hist(slice_dist, bins=bins, alpha=0.5, label=f"slice_sampling (n={len(slice_dist)})")
-    plt.xlabel("Absolute distance to target |Rg - target| (Å)")
-    plt.ylabel("Count")
-    plt.title(f"How close generated proteins are to target Rg = {target_value:.2f} Å")
-    plt.legend()
-    plt.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-
-    thresholds = [0.5, 1.0, 2.0, 3.0]
-    rows = []
-    for method, dist in [("gradient_ascent", gradient_dist), ("slice_sampling", slice_dist)]:
-        row = {
-            "method": method,
-            "n_samples": int(len(dist)),
-            "mean_abs_distance": float(np.mean(dist)) if len(dist) else np.nan,
-            "median_abs_distance": float(np.median(dist)) if len(dist) else np.nan,
-        }
-        for t in thresholds:
-            row[f"within_{t:.1f}A_count"] = int(np.sum(dist <= t))
-            row[f"within_{t:.1f}A_fraction"] = float(np.mean(dist <= t)) if len(dist) else np.nan
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def save_summary_stats(series_map: dict[str, pd.Series], output_path: Path) -> None:
-    rows = []
-    for label, series in series_map.items():
-        rows.append(
-            {
-                "method": label,
-                "count": int(len(series)),
-                "mean_rg": float(series.mean()),
-                "std_rg": float(series.std()),
-                "min_rg": float(series.min()),
-                "max_rg": float(series.max()),
-                "median_rg": float(series.median()),
-            }
+    for m in methods:
+        ax.hist(
+            data_dict[m],
+            bins=bins,
+            alpha=0.55,
+            color=METHOD_COLORS[m],
+            label=METHOD_LABELS[m],
+            density=True,
         )
-    pd.DataFrame(rows).to_csv(output_path, index=False)
+    ax.set_xlabel("Radius of Gyration (Å)", fontsize=11)
+    ax.set_ylabel("Density", fontsize=11)
+    ax.set_title(f"Rg Histogram – Target Tm = {target_tm}°C", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
+
+
+def make_overlay_plot(
+    data_by_method: dict,
+    ref_rg: np.ndarray | None,
+    target_tm: int,
+    out_path: Path,
+) -> None:
+    """
+    Overlay all three generated methods + reference on a single histogram,
+    for a quick visual comparison.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    all_vals = [v for v in data_by_method.values()]
+    if ref_rg is not None:
+        all_vals.append(ref_rg)
+    all_concat = np.concatenate(all_vals)
+    bins = np.linspace(all_concat.min() * 0.95, all_concat.max() * 1.05, 45)
+
+    for method in ["gradient_ascent", "ess", "tess"]:
+        if method in data_by_method:
+            ax.hist(
+                data_by_method[method],
+                bins=bins,
+                alpha=0.45,
+                color=METHOD_COLORS[method],
+                label=METHOD_LABELS[method],
+                density=True,
+            )
+    if ref_rg is not None:
+        ax.hist(
+            ref_rg,
+            bins=bins,
+            alpha=0.30,
+            color=METHOD_COLORS["downloaded"],
+            label=METHOD_LABELS["downloaded"],
+            density=True,
+            histtype="step",
+            linewidth=2,
+        )
+
+    ax.set_xlabel("Radius of Gyration (Å)", fontsize=11)
+    ax.set_ylabel("Density", fontsize=11)
+    ax.set_title(f"Rg: All Methods vs Reference – Target Tm = {target_tm}°C", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
+
+
+def build_summary_csv(
+    all_data: dict,   # {(target_tm, method): np.ndarray}
+    out_path: Path,
+) -> None:
+    rows = []
+    for (target_tm, method), arr in sorted(all_data.items()):
+        rows.append({
+            "target_tm":  target_tm,
+            "method":     method,
+            "n_samples":  len(arr),
+            "mean_rg":    float(np.mean(arr)),
+            "std_rg":     float(np.std(arr)),
+            "median_rg":  float(np.median(arr)),
+            "min_rg":     float(np.min(arr)),
+            "max_rg":     float(np.max(arr)),
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, index=False)
+    print(f"  Saved summary CSV: {out_path}")
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Plot Rg comparison: GA vs ESS vs TESS")
+    parser.add_argument("--results-dir", type=Path, default=Path("runner/results"),
+                        help="Root results directory")
+    parser.add_argument("--plots-dir",   type=Path, default=Path("runner/plots"),
+                        help="Output directory for plots")
+    parser.add_argument("--targets",     type=int,  nargs="+", default=[20, 50, 70],
+                        help="Target Tm values (default: 20 50 70)")
+    args = parser.parse_args()
 
-    series_map = {
-        "initial_feedforward": load_series(args.validation_dir / "rg_initial_feedforward.csv", "initial feed-forward data"),
-        "gradient_ascent": load_series(args.validation_dir / "rg_gradient_ascent.csv", "gradient ascent"),
-        "slice_sampling": load_series(args.validation_dir / "rg_slice_sampling.csv", "slice sampling"),
-    }
+    args.plots_dir.mkdir(parents=True, exist_ok=True)
+    ref_rg = load_reference_rg(args.results_dir)
 
-    save_line_plot(series_map, args.output_dir / "rg_samples_by_method.png")
-    save_distribution_plot(series_map, args.output_dir / "rg_distribution_overlay.png")
-    save_violin_plot(series_map, args.output_dir / "rg_violin.png")
-    save_generated_only_violin(series_map, args.output_dir / "rg_violin_generated_only.png")
-    save_summary_stats(series_map, args.output_dir / "rg_summary_stats.csv")
+    all_data: dict = {}
+    methods = ["gradient_ascent", "ess", "tess"]
 
-    if args.target_value is not None:
-        proximity_df = save_target_distance_hist(
-            series_map,
-            target_value=args.target_value,
-            output_path=args.output_dir / "rg_target_distance_hist.png",
+    for target_tm in args.targets:
+        print(f"\n── Target Tm = {target_tm}°C ──")
+        data_at_target: dict = {}
+
+        for method in methods:
+            arr = load_rg(args.results_dir, target_tm, method)
+            if arr is not None and len(arr) > 0:
+                data_at_target[method] = arr
+                all_data[(target_tm, method)] = arr
+                print(f"  {METHOD_LABELS[method]:25s}: n={len(arr):4d}  "
+                      f"mean={np.mean(arr):.2f}  std={np.std(arr):.2f}")
+            else:
+                print(f"  {METHOD_LABELS[method]:25s}: NOT FOUND – skipping")
+
+        if not data_at_target:
+            print(f"  No data found for target {target_tm}, skipping plots.")
+            continue
+
+        make_violin_plot(
+            data_at_target, target_tm,
+            args.plots_dir / f"rg_violin_target_{target_tm}.png",
         )
-        proximity_df.to_csv(args.output_dir / "rg_target_proximity_summary.csv", index=False)
+        make_histogram(
+            data_at_target, target_tm,
+            args.plots_dir / f"rg_hist_target_{target_tm}.png",
+        )
+        make_overlay_plot(
+            data_at_target, ref_rg, target_tm,
+            args.plots_dir / f"rg_overlay_target_{target_tm}.png",
+        )
 
-    print("Saved plots:")
-    for path in sorted(args.output_dir.glob("*.png")):
-        print(f" - {path}")
-    print(f"Saved summary stats: {args.output_dir / 'rg_summary_stats.csv'}")
-    if args.target_value is not None:
-        print(f"Saved target proximity summary: {args.output_dir / 'rg_target_proximity_summary.csv'}")
+    if all_data:
+        build_summary_csv(all_data, args.plots_dir / "rg_summary_stats.csv")
+
+    print("\nAll plots done.")
 
 
 if __name__ == "__main__":

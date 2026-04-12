@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Experiment Runner: The Oracle Hack Challenge
+Experiment Runner: Gradient Ascent vs ESS vs TESS
 
-This is the master script that orchestrates the entire optimization pipeline:
-1. Generates starting populations
-2. Runs both algorithms on each member
-3. Logs trajectories for analysis
-4. Saves optimized latent vectors for downstream validation
+Orchestrates the full optimization pipeline for all three methods:
+1. Gradient Ascent  — classical gradient-based optimization
+2. ESS              — Elliptical Slice Sampling (Murray et al. 2010)
+3. TESS             — Transport ESS (Cabezas & Nemeth, AISTATS 2023)
 
-The outputs feed directly into the protein-verification pipeline:
+Outputs feed into the protein-verification pipeline:
   - Decode optimized z → PDB
   - Score with ProteinMPNN
-  - Evaluate with ESM2StabP and MDTraj
+  - Evaluate thermal stability with ESM2StabP and MDTraj
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ import random
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run gradient ascent and ESS optimization on random latent vectors"
+        description="Run gradient ascent, ESS, and TESS optimization on random latent vectors"
     )
     parser.add_argument(
         "--checkpoint",
@@ -67,6 +66,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="L2 penalty weight for gradient ascent",
     )
+    # TESS-specific arguments
+    parser.add_argument(
+        "--tess-n-transforms",
+        type=int,
+        default=2,
+        help="Number of G-D coupling layer pairs in the TESS normalizing flow (default 2)",
+    )
+    parser.add_argument(
+        "--tess-d-hidden",
+        type=int,
+        default=32,
+        help="Hidden layer width for TESS coupling networks (default 32)",
+    )
+    parser.add_argument(
+        "--tess-warmup-epochs",
+        type=int,
+        default=3,
+        help="Number of TESS warm-up epochs h (default 3)",
+    )
+    parser.add_argument(
+        "--tess-warmup-chains",
+        type=int,
+        default=10,
+        help="TESS warm-up chains k per epoch (default 10)",
+    )
+    parser.add_argument(
+        "--tess-m-grad-steps",
+        type=int,
+        default=10,
+        help="Adam steps m per TESS NF update (default 10)",
+    )
+    parser.add_argument(
+        "--tess-flow-lr",
+        type=float,
+        default=1e-3,
+        help="Adam learning rate for TESS NF training (default 1e-3)",
+    )
+    parser.add_argument(
+        "--skip-tess",
+        action="store_true",
+        help="Skip TESS (run only gradient ascent and ESS, as in the original pipeline)",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -85,15 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    # Set seeds for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # Load target function
     from optimization.target_function import TargetFunction
     from optimization.gradient_ascent import run_gradient_ascent
     from optimization.elliptical_slice_sampling import run_ess
+    from optimization.transport_ess import run_tess
 
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
@@ -105,16 +145,17 @@ def main() -> None:
     )
     latent_dim = target_fn.get_latent_dim()
     print(f"  Latent dimension: {latent_dim}")
-    print(f"  Target value: {args.target_tm}")
+    print(f"  Target value:     {args.target_tm}")
+    if not args.skip_tess:
+        print(f"  TESS n_transforms={args.tess_n_transforms}, "
+              f"d_hidden={args.tess_d_hidden}, "
+              f"warmup_epochs={args.tess_warmup_epochs}")
 
-    # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate random starting vectors
     print(f"\nGenerating {args.n_vectors} random starting vectors...")
     start_vectors = torch.randn(args.n_vectors, latent_dim)
 
-    # Initialize result containers
     all_trajectories = {
         "vector_id": [],
         "step": [],
@@ -123,19 +164,20 @@ def main() -> None:
     }
 
     z_final_gradient = torch.zeros(args.n_vectors, latent_dim)
-    z_final_ess = torch.zeros(args.n_vectors, latent_dim)
+    z_final_ess      = torch.zeros(args.n_vectors, latent_dim)
+    z_final_tess     = torch.zeros(args.n_vectors, latent_dim)
 
-    initial_scores = []
+    initial_scores        = []
     final_scores_gradient = []
-    final_scores_ess = []
+    final_scores_ess      = []
+    final_scores_tess     = []
 
-    # Run optimization for each starting vector
-    print(f"\nRunning optimization on {args.n_vectors} vectors ({args.n_steps} steps each)...\n")
+    methods = ["gradient_ascent", "ess"] + ([] if args.skip_tess else ["tess"])
+    print(f"\nRunning {', '.join(methods)} on {args.n_vectors} vectors ({args.n_steps} steps each)...\n")
 
     for i in range(args.n_vectors):
         z_start = start_vectors[i]
 
-        # Initial score
         with torch.no_grad():
             output = target_fn(z_start)
             initial_log_score = output.log_likelihood.item()
@@ -144,7 +186,7 @@ def main() -> None:
         print(f"Vector {i + 1}/{args.n_vectors}")
         print(f"  Initial log_score: {initial_log_score:.4f}")
 
-        # Run Gradient Ascent
+        # ── Gradient Ascent ────────────────────────────────────────────
         print(f"  → Running Gradient Ascent...")
         z_final_ga, traj_ga = run_gradient_ascent(
             z_start=z_start,
@@ -156,7 +198,7 @@ def main() -> None:
         z_final_gradient[i] = z_final_ga
         final_scores_gradient.append(traj_ga[-1])
 
-        # Run ESS
+        # ── ESS ────────────────────────────────────────────────────────
         print(f"  → Running ESS...")
         z_final_ess_iter, traj_ess = run_ess(
             z_start=z_start,
@@ -166,12 +208,30 @@ def main() -> None:
         z_final_ess[i] = z_final_ess_iter
         final_scores_ess.append(traj_ess[-1])
 
+        # ── TESS ───────────────────────────────────────────────────────
+        if not args.skip_tess:
+            print(f"  → Running TESS...")
+            z_final_tess_iter, traj_tess = run_tess(
+                z_start=z_start,
+                target_fn=target_fn,
+                steps=args.n_steps,
+                n_transforms=args.tess_n_transforms,
+                d_hidden=args.tess_d_hidden,
+                warmup_epochs=args.tess_warmup_epochs,
+                warmup_chains=args.tess_warmup_chains,
+                m_grad_steps=args.tess_m_grad_steps,
+                flow_lr=args.tess_flow_lr,
+            )
+            z_final_tess[i] = z_final_tess_iter
+            final_scores_tess.append(traj_tess[-1])
+
         print(f"  Results:")
         print(f"    Gradient Ascent: {traj_ga[-1]:.4f} (Δ={traj_ga[-1] - initial_log_score:+.4f})")
         print(f"    ESS:             {traj_ess[-1]:.4f} (Δ={traj_ess[-1] - initial_log_score:+.4f})")
+        if not args.skip_tess:
+            print(f"    TESS:            {traj_tess[-1]:.4f} (Δ={traj_tess[-1] - initial_log_score:+.4f})")
         print()
 
-        # Collect trajectories
         for step, score_ga in enumerate(traj_ga):
             all_trajectories["vector_id"].append(i)
             all_trajectories["step"].append(step)
@@ -184,117 +244,95 @@ def main() -> None:
             all_trajectories["method"].append("ess")
             all_trajectories["log_score"].append(score_ess)
 
-    # Save trajectory data
+        if not args.skip_tess:
+            for step, score_tess in enumerate(traj_tess):
+                all_trajectories["vector_id"].append(i)
+                all_trajectories["step"].append(step)
+                all_trajectories["method"].append("tess")
+                all_trajectories["log_score"].append(score_tess)
+
+    # Save trajectories
     traj_df = pd.DataFrame(all_trajectories)
     traj_csv = args.output_dir / "trajectories.csv"
     traj_df.to_csv(traj_csv, index=False)
     print(f"\n✓ Saved trajectories: {traj_csv}")
 
     # Save optimized vectors
-    torch.save(
-        z_final_gradient,
-        args.output_dir / "z_final_gradient_ascent.pt",
-    )
-    torch.save(
-        z_final_ess,
-        args.output_dir / "z_final_ess.pt",
-    )
-    print(f"✓ Saved optimized vectors:")
-    print(f"    Gradient Ascent: {args.output_dir / 'z_final_gradient_ascent.pt'}")
-    print(f"    ESS:             {args.output_dir / 'z_final_ess.pt'}")
+    torch.save(z_final_gradient, args.output_dir / "z_final_gradient_ascent.pt")
+    torch.save(z_final_ess,      args.output_dir / "z_final_ess.pt")
+    if not args.skip_tess:
+        torch.save(z_final_tess, args.output_dir / "z_final_tess.pt")
+    print(f"✓ Saved optimized vectors in {args.output_dir}")
 
-    # Compute and save statistics
+    # Compute statistics
+    def _stats(scores_final, scores_initial):
+        arr_f = np.array(scores_final)
+        arr_i = np.array(scores_initial)
+        return {
+            "initial_mean_log_score": float(np.mean(arr_i)),
+            "final_mean_log_score":   float(np.mean(arr_f)),
+            "final_max_log_score":    float(np.max(arr_f)),
+            "final_min_log_score":    float(np.min(arr_f)),
+            "final_std_log_score":    float(np.std(arr_f)),
+            "mean_improvement":       float(np.mean(arr_f - arr_i)),
+        }
+
     stats = {
-        "n_vectors": args.n_vectors,
-        "n_steps": args.n_steps,
+        "n_vectors":  args.n_vectors,
+        "n_steps":    args.n_steps,
         "latent_dim": latent_dim,
-        "target_tm": args.target_tm,
-        "seed": args.seed,
-        "gradient_ascent": {
-            "initial_mean_log_score": float(np.mean(initial_scores)),
-            "final_mean_log_score": float(np.mean(final_scores_gradient)),
-            "final_max_log_score": float(np.max(final_scores_gradient)),
-            "final_min_log_score": float(np.min(final_scores_gradient)),
-            "final_std_log_score": float(np.std(final_scores_gradient)),
-            "mean_improvement": float(
-                np.mean(np.array(final_scores_gradient) - np.array(initial_scores))
-            ),
-        },
-        "ess": {
-            "initial_mean_log_score": float(np.mean(initial_scores)),
-            "final_mean_log_score": float(np.mean(final_scores_ess)),
-            "final_max_log_score": float(np.max(final_scores_ess)),
-            "final_min_log_score": float(np.min(final_scores_ess)),
-            "final_std_log_score": float(np.std(final_scores_ess)),
-            "mean_improvement": float(
-                np.mean(np.array(final_scores_ess) - np.array(initial_scores))
-            ),
-        },
+        "target_tm":  args.target_tm,
+        "seed":       args.seed,
+        "gradient_ascent": _stats(final_scores_gradient, initial_scores),
+        "ess":             _stats(final_scores_ess,      initial_scores),
     }
+    if not args.skip_tess:
+        stats["tess"] = _stats(final_scores_tess, initial_scores)
 
     stats_json = args.output_dir / "optimization_stats.json"
     stats_json.write_text(json.dumps(stats, indent=2))
     print(f"✓ Saved statistics: {stats_json}")
 
-    # Print summary
+    # Summary
     print("\n" + "=" * 70)
     print("OPTIMIZATION SUMMARY")
     print("=" * 70)
-    print(f"\nGradient Ascent:")
-    print(
-        f"  Mean initial score:    {stats['gradient_ascent']['initial_mean_log_score']:8.4f}"
-    )
-    print(
-        f"  Mean final score:      {stats['gradient_ascent']['final_mean_log_score']:8.4f}"
-    )
-    print(
-        f"  Mean improvement:      {stats['gradient_ascent']['mean_improvement']:+8.4f}"
-    )
-    print(f"  Best score:            {stats['gradient_ascent']['final_max_log_score']:8.4f}")
 
-    print(f"\nElliptical Slice Sampling:")
-    print(
-        f"  Mean initial score:    {stats['ess']['initial_mean_log_score']:8.4f}"
-    )
-    print(f"  Mean final score:      {stats['ess']['final_mean_log_score']:8.4f}")
-    print(f"  Mean improvement:      {stats['ess']['mean_improvement']:+8.4f}")
-    print(f"  Best score:            {stats['ess']['final_max_log_score']:8.4f}")
+    def _print_method(name, s):
+        print(f"\n{name}:")
+        print(f"  Mean initial score:  {s['initial_mean_log_score']:8.4f}")
+        print(f"  Mean final score:    {s['final_mean_log_score']:8.4f}")
+        print(f"  Mean improvement:    {s['mean_improvement']:+8.4f}")
+        print(f"  Best score:          {s['final_max_log_score']:8.4f}")
+        print(f"  Score std:           {s['final_std_log_score']:8.4f}")
 
-    winner = (
-        "ESS"
-        if stats["ess"]["mean_improvement"] > stats["gradient_ascent"]["mean_improvement"]
-        else "Gradient Ascent"
-    )
+    _print_method("Gradient Ascent", stats["gradient_ascent"])
+    _print_method("Elliptical Slice Sampling (ESS)", stats["ess"])
+    if not args.skip_tess:
+        _print_method("Transport ESS (TESS)", stats["tess"])
+
+    # Determine winner
+    candidates = {
+        "Gradient Ascent": stats["gradient_ascent"]["mean_improvement"],
+        "ESS":             stats["ess"]["mean_improvement"],
+    }
+    if not args.skip_tess:
+        candidates["TESS"] = stats["tess"]["mean_improvement"]
+    winner = max(candidates, key=candidates.get)
     print(f"\n🏆 Winner (by mean improvement): {winner}")
 
     print("\n" + "=" * 70)
     print("NEXT STEPS: Validation Pipeline")
     print("=" * 70)
-    print(f"""
-The optimized latent vectors are ready for downstream validation:
+    print("""
+Run the Rg pipeline for all three methods:
+  $ bash runner/run_rg_pipeline.sh
 
-1. Decode optimized z vectors back to protein structures:
-   $ python validation/decode_and_validate.py \\
-       --z-vectors optimization/outputs/z_final_ess.pt \\
-       --decoder-checkpoint <path/to/ae.ckpt> \\
-       --output-dir validation/outputs
+Or submit to SLURM:
+  $ sbatch runner/submit_rg_pipeline.slurm
 
-2. Score with ProteinMPNN (sequence design):
-   $ python validation/score_with_proteinmpnn.py \\
-       --pdbs validation/outputs/pdbs \\
-       --output-dir validation/outputs
-
-3. Evaluate thermal stability with ESM2StabP:
-   $ python validation/predict_thermal_stability.py \\
-       --sequences validation/outputs/sequences \\
-       --output-dir validation/outputs
-
-4. Compare metrics: original vs optimized proteins
-   $ python validation/compare_metrics.py \\
-       --original-metrics regression/outputs/test_predictions.csv \\
-       --optimized-metrics validation/outputs/metrics.csv
-
-See OPTIMIZATION_INSTRUCTIONS.md for detailed usage examples.
+The pipeline will decode z_final_tess.pt → PDB → Rg and compare
+radius of gyration distributions across all three methods.
 """)
 
 
