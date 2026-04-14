@@ -1,3 +1,0 @@
-method,n_samples,mean_abs_distance,median_abs_distance,within_0.5A_count,within_0.5A_fraction,within_1.0A_count,within_1.0A_fraction,within_2.0A_count,within_2.0A_fraction,within_3.0A_count,within_3.0A_fraction
-gradient_ascent,100,41.034650089159456,43.90755549013893,0,0.0,0,0.0,0,0.0,0,0.0
-slice_sampling,100,38.980989256189986,37.293091739427894,0,0.0,0,0.0,0,0.0,0,0.0
