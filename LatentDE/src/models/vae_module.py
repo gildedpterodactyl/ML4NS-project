@@ -149,6 +149,7 @@ class CNNVAE(BaseVAE):
         lr: float = 0.001,
         device: Union[torch.device, str] = "cuda",
         reduction: str = "sum",
+        neg_floor: float = None,
     ):
         super(CNNVAE, self).__init__(
             expected_kl, pretrained_encoder_path, latent_dim,

@@ -116,7 +116,7 @@ def train(args):
     ]
     callback_list = [
         callbacks.RichModelSummary(),
-        callbacks.RichProgressBar(),
+        callbacks.TQDMProgressBar(),
         callbacks.ModelCheckpoint(
             dirpath=ckpt_dirpath,
             filename=ckpt_filename,
