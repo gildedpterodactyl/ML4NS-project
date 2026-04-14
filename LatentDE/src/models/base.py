@@ -174,7 +174,7 @@ class BaseVAE(LightningModule):
     def model_step(self, batch):
         x, y = batch["sequences"], batch["fitness"]
         y = y.unsqueeze(1)
-        dec_probs, pred_property, mu, logvar, seqs_ids = self.forward(x)
+        dec_probs, pred_property, mu, logvar, seqs_ids, *_ = self.forward(x)
 
         loss, kl_loss, recon_loss, mse_loss = \
             self.loss_function(dec_probs, seqs_ids, pred_property, y, mu, logvar)
