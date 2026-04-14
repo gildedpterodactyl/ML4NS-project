@@ -1,0 +1,6 @@
+# Local generated artifacts
+LatentDE/.project-root
+LatentDE/**/__pycache__/
+LatentDE/**/*.py[cod]
+LatentDE/wandb/
+landscape_params/
