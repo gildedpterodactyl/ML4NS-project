@@ -4,7 +4,7 @@ ESS and TESS optimization in latent space for protein fitness optimization.
 ESS  - Evolutionary Strategy Sampling: Gaussian perturbation in latent space,
        select top-k by predicted fitness.
 TESS - Trustworthy ESS: ESS with a trust-region constraint that keeps candidates
-       within a bounded Mahalanobis/L2 distance from the wild-type latent vector.
+       within a bounded L2 distance from the wild-type latent vector.
 """
 
 import torch
@@ -30,7 +30,7 @@ class ESSConfig:
 class TESSConfig(ESSConfig):
     """Configuration for TESS (trust-region ESS) optimization."""
     trust_radius: float = 4.0           # Max L2 distance from WT latent (trust region)
-    adaptive_trust: bool = True         # Expand/contract trust radius based on improvement
+    adaptive_trust: bool = False        # If True, expand/contract trust radius gen-over-gen
     trust_expand: float = 1.1           # Factor to expand trust radius on improvement
     trust_contract: float = 0.9         # Factor to contract trust radius on no improvement
     trust_min: float = 1.0              # Minimum trust radius
@@ -190,7 +190,8 @@ def run_tess(
     All ESS steps apply, PLUS after perturbation:
         - Candidates violating the trust region (||z - z_wt|| > R) are
           projected back onto the L2 ball boundary.
-        - Optionally, R is adapted: expanded on improvement, contracted otherwise.
+        - Optionally, R is adapted gen-over-gen: expanded on improvement,
+          contracted otherwise. Default is fixed radius (adaptive_trust=False).
 
     This prevents the optimizer from wandering into structurally invalid
     regions of latent space far from the wild-type, which is critical when
@@ -230,7 +231,8 @@ def run_tess(
         trust_radius = config.trust_radius
         elites = z_wt.expand(config.top_k, -1).clone()       # [top_k, D]
 
-        gen_best_fit = -float("inf")
+        prev_gen_best = -float("inf")
+        gen_best_fit  = -float("inf")
 
         for gen in range(config.num_generations):
             with torch.no_grad():
@@ -251,15 +253,16 @@ def run_tess(
 
                 gen_best = elite_fits[0].item()
 
-                # Adaptive trust radius
+                # Adaptive trust radius: compare THIS gen vs PREVIOUS gen
                 if config.adaptive_trust:
-                    if gen_best > gen_best_fit:
+                    if gen_best > prev_gen_best:
                         trust_radius = min(config.trust_max,
                                           trust_radius * config.trust_expand)
                     else:
                         trust_radius = max(config.trust_min,
                                           trust_radius * config.trust_contract)
 
+                prev_gen_best = gen_best
                 if gen_best > gen_best_fit:
                     gen_best_fit = gen_best
 
