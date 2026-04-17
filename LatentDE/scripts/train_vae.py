@@ -40,7 +40,7 @@ def train(args):
     cfg = importlib.import_module(parse_module_name_from_path(args.config_file))
     # general config
     seed_everything(args.seed, workers=True)
-    torch.set_float32_matmul_precision(cfg.precision)
+    torch.set_float32_matmul_precision("medium")
     accelerator = "cpu" if args.devices == "-1" else "gpu"
     device = torch.device("cuda" if accelerator == "gpu" else "cpu")
 

@@ -46,7 +46,7 @@ freeze_encoder = True
 """
 data_kwargs = {
     "train_val_split": (0.9, 0.1),
-    "num_workers": 64,
+    "num_workers": 8,
 }
 
 
