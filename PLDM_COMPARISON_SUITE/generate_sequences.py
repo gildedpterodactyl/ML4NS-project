@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tess-warp-strength", type=float, default=0.75)
     p.add_argument("--delta-final", type=float, default=None)
     p.add_argument("--latent-temperature", type=float, default=0.75)
+    p.add_argument("--decode-temperature", type=float, default=0.5,
+                   help="Softmax temperature for sequence decoding (>0). "
+                        "1.0=uniform sampling, 0.0 approaches argmax. Default 0.5.")
+    p.add_argument("--chain-init-noise", type=float, default=0.05,
+                   help="Std of per-chain perturbation added to z_start so chains "
+                        "explore different neighbourhoods. Default 0.05.")
     p.add_argument("--burnin", type=int, default=20)
     p.add_argument("--max-steps", type=int, default=5000)
     p.add_argument("--mode", type=str, choices=["baseline", "ess", "tess", "all"], default="all")
@@ -168,6 +174,34 @@ def validate_model_type(model_type: str, ckpt_path: Path, label: str) -> None:
 
 
 @torch.no_grad()
+def decode_with_temperature(
+    ae: torch.nn.Module,
+    z: torch.Tensor,
+    temperature: float,
+) -> str:
+    """Decode a single latent vector z to a sequence string.
+
+    When temperature > 0, each position is sampled from the softmax
+    distribution rather than taken as argmax.  This ensures that
+    nearby latent points (which have similar but non-identical logits)
+    produce *distinct* sequences, recovering the diversity that the
+    sampler generates in latent space.
+
+    temperature = 0.0  →  pure argmax (old behaviour, causes collapse)
+    temperature = 0.5  →  sharply peaked sampling (recommended default)
+    temperature = 1.0  →  full categorical sampling
+    """
+    logits = ae.decode(z.unsqueeze(0)).squeeze(0)  # (vocab, seq_len)
+    if temperature <= 0.0:
+        idx = torch.argmax(logits, dim=0)
+    else:
+        probs = torch.softmax(logits / temperature, dim=0)  # (vocab, seq_len)
+        # sample independently at each position
+        idx = torch.multinomial(probs.T, num_samples=1).squeeze(-1)  # (seq_len,)
+    return clean_seq(inds_to_seq(idx))
+
+
+@torch.no_grad()
 def ess_step(
     z_current: torch.Tensor,
     ll_current: torch.Tensor,
@@ -178,7 +212,13 @@ def ess_step(
     proposal_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     max_attempts: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    nu = temperature * torch.randn_like(z_current)
+    # FIX 1: nu must NOT be scaled by temperature.
+    # In Elliptical Slice Sampling the auxiliary vector nu is drawn from
+    # the same prior as z (i.e. N(0,I)).  Scaling nu down shrinks the
+    # proposal ellipse dramatically, trapping all chains in a tiny basin
+    # around z_current and causing every decoded sequence to be identical.
+    # temperature is used only via log_y to control the acceptance threshold.
+    nu = torch.randn_like(z_current)  # prior sample — no temperature scaling
     log_y = ll_current + torch.log(torch.rand(1, device=z_current.device))
 
     theta = torch.rand(1, device=z_current.device) * (2.0 * math.pi)
@@ -223,13 +263,23 @@ def sample_ess_tess(
     delta: Optional[float],
     delta_final: Optional[float],
     temperature: float,
+    decode_temperature: float = 0.5,
+    chain_init_noise: float = 0.05,
     proposal_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> pd.DataFrame:
     rows = []
     per_chain = math.ceil(n / num_chains)
 
     for chain in range(num_chains):
-        z = z_start.clone()
+        # FIX 2: perturb z_start independently per chain so chains explore
+        # different neighbourhoods from the very first step.  Without this,
+        # all chains start at the same point and — even with a correct ESS
+        # proposal — converge on the same local basin.
+        if chain_init_noise > 0.0:
+            z = z_start.clone() + chain_init_noise * torch.randn_like(z_start)
+        else:
+            z = z_start.clone()
+
         ll = ll_fn(z.unsqueeze(0)).squeeze(0)
         saved = 0
         for step in range(max_steps):
@@ -249,7 +299,13 @@ def sample_ess_tess(
             )
             if step < burnin:
                 continue
-            seq = clean_seq(inds_to_seq(torch.argmax(ae.decode(z.unsqueeze(0)), dim=1).squeeze(0)))
+
+            # FIX 3: use temperature-sampled decode instead of argmax.
+            # Argmax is deterministic: all latent points in the same
+            # decoder basin produce the *exact same* sequence string,
+            # hiding the diversity the sampler actually generates.
+            # Temperature sampling preserves that latent diversity.
+            seq = decode_with_temperature(ae, z, temperature=decode_temperature)
             rows.append({"chain": chain, "step": step, "attempts": attempts, "sequence": seq, "score": float(ll.item())})
             saved += 1
             if saved >= per_chain:
@@ -267,6 +323,8 @@ def main() -> None:
         raise ValueError(f"latent-temperature must be > 0, got {args.latent_temperature}")
     if args.delta_final is not None and args.delta_final <= 0:
         raise ValueError(f"delta-final must be > 0 when provided, got {args.delta_final}")
+    if args.decode_temperature < 0:
+        raise ValueError(f"decode-temperature must be >= 0, got {args.decode_temperature}")
     set_seed(args.seed)
 
     script_dir = Path(__file__).resolve().parent
@@ -348,6 +406,9 @@ def main() -> None:
     else:
         print("[likelihood] regressor-only score (ESM2 disabled)")
 
+    print(f"[decode] temperature={args.decode_temperature:.3f} ({'argmax' if args.decode_temperature <= 0 else 'sampled'})")
+    print(f"[chains] init noise std={args.chain_init_noise:.4f}")
+
     modes = [args.mode] if args.mode != "all" else ["baseline", "ess", "tess"]
     if "baseline" in modes:
         validate_model_type(args.baseline_model_type, baseline_ckpt, label="Baseline diffusion")
@@ -375,6 +436,8 @@ def main() -> None:
             delta=args.tess_delta,
             delta_final=args.delta_final,
             temperature=args.latent_temperature,
+            decode_temperature=args.decode_temperature,
+            chain_init_noise=args.chain_init_noise,
         )
         ess_df.to_csv(out_dir / "results_ess.csv", index=False)
 
@@ -393,6 +456,8 @@ def main() -> None:
             delta=args.tess_delta,
             delta_final=args.delta_final,
             temperature=args.latent_temperature,
+            decode_temperature=args.decode_temperature,
+            chain_init_noise=args.chain_init_noise,
             proposal_transform=tess_warp,
         )
         tess_df.to_csv(out_dir / "results_tess.csv", index=False)
