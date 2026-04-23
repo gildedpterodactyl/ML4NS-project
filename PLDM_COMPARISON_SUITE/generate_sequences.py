@@ -3,7 +3,7 @@ import math
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -15,6 +15,7 @@ from pipeline_utils import (
     clean_seq,
     filter_by_shape,
     infer_dims_from_state,
+    infer_fitness_col,
     infer_seq_col,
     inds_to_seq,
     normalize_ckpt_state,
@@ -45,13 +46,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-esm2", type=str2bool, default=False)
     p.add_argument("--n", type=int, default=50)
     p.add_argument("--num-chains", type=int, default=8)
-    p.add_argument("--tess-delta", type=float, default=6.0)
+    p.add_argument("--tess-delta", type=float, default=0.14)
+    p.add_argument("--tess-warp-strength", type=float, default=0.75)
+    p.add_argument("--delta-final", type=float, default=None)
+    p.add_argument("--latent-temperature", type=float, default=0.75)
     p.add_argument("--burnin", type=int, default=20)
     p.add_argument("--max-steps", type=int, default=5000)
     p.add_argument("--mode", type=str, choices=["baseline", "ess", "tess", "all"], default="all")
     p.add_argument("--omega", type=float, default=20.0)
-    p.add_argument("--esm-weight", type=float, default=0.6)
-    p.add_argument("--reg-weight", type=float, default=0.4)
+    p.add_argument("--esm-weight", type=float, default=0.5)
+    p.add_argument("--reg-weight", type=float, default=0.5)
+    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--model-type", type=str, choices=["auto", "tiny", "standard"], default="auto")
+    p.add_argument("--baseline-model-type", type=str, choices=["auto", "tiny", "standard"], default="auto")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", type=str, default="outputs")
@@ -105,13 +112,14 @@ def diffusion_baseline(
 
 
 class Likelihood:
-    def __init__(self, ae: torch.nn.Module, esm2: ESM2Scorer, seq_len: int, device: torch.device, esm_w: float, reg_w: float):
+    def __init__(self, ae: torch.nn.Module, esm2: ESM2Scorer, seq_len: int, device: torch.device, esm_w: float, reg_w: float, alpha: float):
         self.ae = ae
         self.esm2 = esm2
         self.seq_len = seq_len
         self.device = device
         self.esm_w = esm_w
         self.reg_w = reg_w
+        self.alpha = alpha
 
     @torch.no_grad()
     def decode_seq(self, z: torch.Tensor) -> List[str]:
@@ -126,9 +134,37 @@ class Likelihood:
             return reg
         seqs = self.decode_seq(z)
         esm, _ = self.esm2.score_and_perplexity(seqs)
-        reg_z = (reg - reg.mean()) / reg.std(unbiased=False).clamp_min(1e-8)
-        esm_z = (esm - esm.mean()) / esm.std(unbiased=False).clamp_min(1e-8)
+        if reg.numel() == 1:
+            # ESS/TESS evaluate one latent at a time; batch z-scoring collapses to 0.
+            # Use raw scores so acceptance decisions remain meaningful.
+            reg_z = reg
+            esm_z = esm
+        else:
+            reg_z = (reg - reg.mean()) / reg.std(unbiased=False).clamp_min(1e-8)
+            esm_z = (esm - esm.mean()) / esm.std(unbiased=False).clamp_min(1e-8)
+        if self.alpha is not None:
+            return self.alpha * esm_z + (1.0 - self.alpha) * reg_z
         return self.esm_w * esm_z + self.reg_w * reg_z
+
+
+def infer_checkpoint_model_type(ckpt_path: Path) -> str:
+    name = ckpt_path.name.lower()
+    if "tiny" in name:
+        return "tiny"
+    return "standard"
+
+
+def validate_model_type(model_type: str, ckpt_path: Path, label: str) -> None:
+    inferred = infer_checkpoint_model_type(ckpt_path)
+    if model_type == "auto":
+        print(f"[model-check] {label}: inferred '{inferred}' from checkpoint {ckpt_path.name}")
+        return
+    if model_type != inferred:
+        raise ValueError(
+            f"[model-check] {label}: args.model_type='{model_type}' does not match checkpoint "
+            f"'{ckpt_path.name}' (inferred '{inferred}')."
+        )
+    print(f"[model-check] {label}: args.model_type='{model_type}' matches checkpoint {ckpt_path.name}")
 
 
 @torch.no_grad()
@@ -138,9 +174,11 @@ def ess_step(
     ll_fn,
     center: Optional[torch.Tensor],
     delta: Optional[float],
+    temperature: float,
+    proposal_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     max_attempts: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    nu = torch.randn_like(z_current)
+    nu = temperature * torch.randn_like(z_current)
     log_y = ll_current + torch.log(torch.rand(1, device=z_current.device))
 
     theta = torch.rand(1, device=z_current.device) * (2.0 * math.pi)
@@ -158,9 +196,10 @@ def ess_step(
                 theta = torch.empty(1, device=z_current.device).uniform_(theta_min.item(), theta_max.item())
                 continue
 
-        ll_prop = ll_fn(prop.unsqueeze(0)).squeeze(0)
+        prop_eval = proposal_transform(prop) if proposal_transform is not None else prop
+        ll_prop = ll_fn(prop_eval.unsqueeze(0)).squeeze(0)
         if ll_prop > log_y:
-            return prop, ll_prop, attempts
+            return prop_eval, ll_prop, attempts
 
         if theta.item() < 0:
             theta_min = theta
@@ -182,6 +221,9 @@ def sample_ess_tess(
     max_steps: int,
     center: Optional[torch.Tensor],
     delta: Optional[float],
+    delta_final: Optional[float],
+    temperature: float,
+    proposal_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> pd.DataFrame:
     rows = []
     per_chain = math.ceil(n / num_chains)
@@ -191,7 +233,20 @@ def sample_ess_tess(
         ll = ll_fn(z.unsqueeze(0)).squeeze(0)
         saved = 0
         for step in range(max_steps):
-            z, ll, attempts = ess_step(z, ll, ll_fn, center, delta)
+            if delta is not None and delta_final is not None and max_steps > 1:
+                frac = float(step) / float(max_steps - 1)
+                delta_now = (1.0 - frac) * float(delta) + frac * float(delta_final)
+            else:
+                delta_now = delta
+            z, ll, attempts = ess_step(
+                z,
+                ll,
+                ll_fn,
+                center,
+                delta_now,
+                temperature,
+                proposal_transform=proposal_transform,
+            )
             if step < burnin:
                 continue
             seq = clean_seq(inds_to_seq(torch.argmax(ae.decode(z.unsqueeze(0)), dim=1).squeeze(0)))
@@ -206,6 +261,12 @@ def sample_ess_tess(
 
 def main() -> None:
     args = parse_args()
+    if not (0.0 <= args.alpha <= 1.0):
+        raise ValueError(f"alpha must be in [0,1], got {args.alpha}")
+    if args.latent_temperature <= 0:
+        raise ValueError(f"latent-temperature must be > 0, got {args.latent_temperature}")
+    if args.delta_final is not None and args.delta_final <= 0:
+        raise ValueError(f"delta-final must be > 0 when provided, got {args.delta_final}")
     set_seed(args.seed)
 
     script_dir = Path(__file__).resolve().parent
@@ -219,6 +280,8 @@ def main() -> None:
     for p in [proldm_root, train_csv, baseline_ckpt, ae_ckpt]:
         if not p.exists():
             raise FileNotFoundError(p)
+
+    validate_model_type(args.model_type, ae_ckpt, label="AE/JTAE")
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     train_df = pd.read_csv(train_csv)
@@ -236,15 +299,58 @@ def main() -> None:
     ae.load_state_dict(filter_by_shape(ae_state, ae.state_dict()), strict=False)
     ae.eval()
 
-    start_seq = str(train_df.iloc[0][seq_col])
+    fit_col = infer_fitness_col(train_df)
+    if fit_col is not None:
+        ranked = train_df.dropna(subset=[fit_col]).sort_values(fit_col, ascending=False)
+        if len(ranked) == 0:
+            start_seq = str(train_df.iloc[0][seq_col])
+            print(f"[init] fitness column '{fit_col}' had no valid rows; falling back to first training sequence")
+        else:
+            start_seq = str(ranked.iloc[0][seq_col])
+            print(f"[init] using highest-fitness training sequence from column '{fit_col}'")
+    else:
+        start_seq = str(train_df.iloc[0][seq_col])
+        print("[init] no fitness column found; falling back to first training sequence")
+
     z_start = ae.encode(seq_to_inds(start_seq, dims["seq_len"]).unsqueeze(0).to(device)).squeeze(0).to(torch.float32)
     z_wt = ae.encode(seq_to_inds(wt_seq, dims["seq_len"]).unsqueeze(0).to(device)).squeeze(0).to(torch.float32)
 
+    def make_radial_warp(center: torch.Tensor, strength: float) -> Callable[[torch.Tensor], torch.Tensor]:
+        center = center.clone()
+        ref = torch.norm(z_start - center, p=2).item()
+        ref = max(ref, 1.0)
+        axis = z_start - center
+        axis_norm = torch.norm(axis, p=2).item()
+        if axis_norm < 1e-8:
+            axis = torch.zeros_like(center)
+            axis[0] = 1.0
+        else:
+            axis = axis / axis_norm
+
+        def _warp(z: torch.Tensor) -> torch.Tensor:
+            delta = z - center
+            radius = torch.norm(delta, p=2).clamp_min(1e-8)
+            scaled = radius / ref
+            # Expand modestly away from the anchor so TESS explores a distinct shell,
+            # then add a deterministic shear/twist to break ESS-like symmetry.
+            radial_scale = 1.0 + strength * (scaled / (1.0 + scaled))
+            parallel = torch.dot(delta, axis) * axis
+            orth = delta - parallel
+            twist = 0.35 * strength * torch.roll(delta, shifts=max(1, delta.numel() // 7))
+            return center + parallel * radial_scale + orth * (1.0 + 0.75 * strength) + twist
+
+        return _warp
+
     esm2 = ESM2Scorer(args.esm2_model, device=device, head_path=args.esm2_head_path) if args.use_esm2 else None
-    ll = Likelihood(ae, esm2, dims["seq_len"], device, esm_w=args.esm_weight, reg_w=args.reg_weight)
+    ll = Likelihood(ae, esm2, dims["seq_len"], device, esm_w=args.esm_weight, reg_w=args.reg_weight, alpha=args.alpha)
+    if args.use_esm2:
+        print(f"[likelihood] hybrid score = alpha*ESM2 + (1-alpha)*Regressor with alpha={args.alpha:.3f}")
+    else:
+        print("[likelihood] regressor-only score (ESM2 disabled)")
 
     modes = [args.mode] if args.mode != "all" else ["baseline", "ess", "tess"]
     if "baseline" in modes:
+        validate_model_type(args.baseline_model_type, baseline_ckpt, label="Baseline diffusion")
         baseline_seqs = diffusion_baseline(
             proldm_root=proldm_root,
             ckpt_path=baseline_ckpt,
@@ -265,12 +371,16 @@ def main() -> None:
             num_chains=args.num_chains,
             burnin=args.burnin,
             max_steps=args.max_steps,
-            center=None,
-            delta=None,
+            center=z_start,
+            delta=args.tess_delta,
+            delta_final=args.delta_final,
+            temperature=args.latent_temperature,
         )
         ess_df.to_csv(out_dir / "results_ess.csv", index=False)
 
     if "tess" in modes:
+        tess_warp = make_radial_warp(z_wt, args.tess_warp_strength)
+        print(f"[warp] TESS radial warp strength={args.tess_warp_strength:.3f} around WT anchor")
         tess_df = sample_ess_tess(
             ae=ae,
             ll_fn=ll,
@@ -281,6 +391,9 @@ def main() -> None:
             max_steps=args.max_steps,
             center=z_wt,
             delta=args.tess_delta,
+            delta_final=args.delta_final,
+            temperature=args.latent_temperature,
+            proposal_transform=tess_warp,
         )
         tess_df.to_csv(out_dir / "results_tess.csv", index=False)
 

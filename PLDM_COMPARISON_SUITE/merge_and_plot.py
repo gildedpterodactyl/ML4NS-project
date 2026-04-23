@@ -3,7 +3,7 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,6 +27,13 @@ from pipeline_utils import (
 )
 
 
+METHOD_STYLES = {
+    "baseline_pldm": ("Baseline", "tab:orange"),
+    "ess": ("ESS", "tab:blue"),
+    "tess": ("TESS", "tab:red"),
+}
+
+
 def str2bool(v: str) -> bool:
     if isinstance(v, bool):
         return v
@@ -42,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Merge method CSVs and create common plots/tables.")
     p.add_argument("--proldm-root", type=str, default="../PROLDM_OUTLIER")
     p.add_argument("--train-csv", type=str, default="data/mut_data/GFP-train.csv")
+    p.add_argument("--test-csv", type=str, default="data/mut_data/GFP-test.csv")
     p.add_argument("--ae-ckpt", type=str, default="train_logs/GFP/epoch_1000.pt")
     p.add_argument("--dataset", type=str, default="GFP")
     p.add_argument("--baseline-results", type=str, default="baseline/results/results.csv")
@@ -55,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--with-structure", type=str2bool, default=False)
     p.add_argument("--wt-pdb", type=str, default="1GFL")
-    p.add_argument("--umap-train-samples", type=int, default=5000)
+    p.add_argument("--umap-train-samples", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -88,6 +96,16 @@ def dkl(p: np.ndarray, q: np.ndarray) -> float:
     return float(np.sum(p * np.log((p + 1e-12) / (q + 1e-12))))
 
 
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    cols = list(df.columns)
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+    rows = []
+    for _, row in df.iterrows():
+        rows.append("| " + " | ".join(str(row[c]) for c in cols) + " |")
+    return "\n".join([header, sep, *rows])
+
+
 def ensure_pdb(wt_pdb: str, results_dir: Path) -> Path:
     local = Path(wt_pdb)
     if local.exists():
@@ -105,6 +123,261 @@ def load_method_csv(path: Path) -> pd.DataFrame:
     return df
 
 
+def plot_stability_fitness(df: pd.DataFrame, results_dir: Path) -> None:
+    if "plddt_score" not in df.columns or df["plddt_score"].isna().all():
+        plt.figure(figsize=(8, 6))
+        plt.text(
+            0.5,
+            0.5,
+            "pLDDT unavailable\n(install ESMFold/OpenFold runtime to enable)",
+            ha="center",
+            va="center",
+            fontsize=12,
+        )
+        plt.axis("off")
+        plt.title("Stability-Fitness Pareto Front")
+        plt.tight_layout()
+        plt.savefig(results_dir / "plot_stability_fitness_pareto.png", dpi=220)
+        plt.close()
+        return
+    pred_col = "esm2_fitness" if "esm2_fitness" in df.columns and not df["esm2_fitness"].isna().all() else "pldm_regressor_score"
+    plt.figure(figsize=(8, 6))
+    for m, c in [("baseline_pldm", "tab:orange"), ("ess", "tab:blue"), ("tess", "tab:red")]:
+        d = df[(df["method_name"] == m) & df["plddt_score"].notna() & df[pred_col].notna()]
+        plt.scatter(d["plddt_score"], d[pred_col], c=c, alpha=0.7, s=16, label=m)
+    plt.axvline(70, color="gray", linestyle="--", linewidth=1, alpha=0.8)
+    plt.axvline(50, color="gray", linestyle=":", linewidth=1, alpha=0.7)
+    plt.xlabel("pLDDT score")
+    plt.ylabel("Predicted fluorescence" if pred_col == "esm2_fitness" else "PRO-LDM regressor score")
+    plt.title("Stability-Fitness Pareto Front")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(results_dir / "plot_stability_fitness_pareto.png", dpi=220)
+    plt.close()
+
+
+def plot_perplexity_histogram(df: pd.DataFrame, results_dir: Path) -> None:
+    if "perplexity" not in df.columns or df["perplexity"].isna().all():
+        return
+    plt.figure(figsize=(8, 6))
+    bins = 25
+    for m, c in [("baseline_pldm", "tab:orange"), ("ess", "tab:blue"), ("tess", "tab:red")]:
+        vals = df.loc[df["method_name"] == m, "perplexity"].dropna()
+        if len(vals) > 0:
+            plt.hist(vals, bins=bins, alpha=0.35, density=True, color=c, label=m)
+    plt.xlabel("Sequence perplexity")
+    plt.ylabel("Density")
+    plt.title("Perplexity Distribution Histogram")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(results_dir / "plot_perplexity_histogram.png", dpi=220)
+    plt.close()
+
+
+def plot_aa_propensity_heatmap(df: pd.DataFrame, results_dir: Path) -> None:
+    positions = [64, 65, 66, 67, 68, 69, 70]
+    aa_vocab = list("ACDEFGHIKLMNPQRSTVWY")
+    aa_to_idx = {aa: i for i, aa in enumerate(aa_vocab)}
+    methods = [("baseline_pldm", "Baseline"), ("ess", "ESS"), ("tess", "TESS")]
+    matrices = []
+    for method, _ in methods:
+        sub = df[df["method_name"] == method]["sequence"].astype(str).tolist()
+        mat = np.zeros((len(aa_vocab), len(positions)), dtype=np.float64)
+        if len(sub) > 0:
+            for seq in sub:
+                for j, pos in enumerate(positions):
+                    idx = pos - 1
+                    if idx < len(seq):
+                        aa = seq[idx]
+                        if aa in aa_to_idx:
+                            mat[aa_to_idx[aa], j] += 1.0
+            mat /= float(len(sub))
+        matrices.append(mat)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+    vmax = max(float(m.max()) for m in matrices) if matrices else 1.0
+    for ax, (method, title), mat in zip(axes, methods, matrices):
+        im = ax.imshow(mat, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=max(vmax, 1e-8))
+        ax.set_title(title)
+        ax.set_xticks(range(len(positions)))
+        ax.set_xticklabels([str(p) for p in positions], rotation=45)
+        ax.set_yticks(range(len(aa_vocab)))
+        ax.set_yticklabels(aa_vocab)
+        ax.set_xlabel("Position")
+    axes[0].set_ylabel("Amino acid")
+    fig.suptitle("Amino Acid Propensity at Conserved GFP Positions")
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="Frequency")
+    fig.tight_layout()
+    fig.savefig(results_dir / "plot_aa_propensity_heatmap.png", dpi=220)
+    plt.close(fig)
+
+
+def plot_aa_propensity_heatmap_single(df: pd.DataFrame, results_dir: Path, method_name: str) -> None:
+    positions = [64, 65, 66, 67, 68, 69, 70]
+    aa_vocab = list("ACDEFGHIKLMNPQRSTVWY")
+    aa_to_idx = {aa: i for i, aa in enumerate(aa_vocab)}
+    mat = np.zeros((len(aa_vocab), len(positions)), dtype=np.float64)
+    sub = df[df["method_name"] == method_name]["sequence"].astype(str).tolist()
+    if len(sub) > 0:
+        for seq in sub:
+            for j, pos in enumerate(positions):
+                idx = pos - 1
+                if idx < len(seq):
+                    aa = seq[idx]
+                    if aa in aa_to_idx:
+                        mat[aa_to_idx[aa], j] += 1.0
+        mat /= float(len(sub))
+
+    label = METHOD_STYLES.get(method_name, (method_name, "tab:gray"))[0]
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(mat, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=max(float(mat.max()), 1e-8))
+    ax.set_title(label)
+    ax.set_xticks(range(len(positions)))
+    ax.set_xticklabels([str(p) for p in positions], rotation=45)
+    ax.set_yticks(range(len(aa_vocab)))
+    ax.set_yticklabels(aa_vocab)
+    ax.set_xlabel("Position")
+    ax.set_ylabel("Amino acid")
+    fig.suptitle("Amino Acid Propensity at Conserved GFP Positions")
+    fig.colorbar(im, ax=ax, shrink=0.8, label="Frequency")
+    fig.tight_layout()
+    fig.savefig(results_dir / "plot_aa_propensity_heatmap.png", dpi=220)
+    plt.close(fig)
+
+
+def plot_umap_views(
+    umap_df: pd.DataFrame,
+    fitness_vals: Optional[np.ndarray],
+    results_dir: Path,
+    method_filter: Optional[str] = None,
+) -> None:
+    natural_d = umap_df[umap_df["source"] == "natural"]
+    if method_filter is None:
+        specs = [(m, c, 0.8, 14) for m, (_, c) in METHOD_STYLES.items()]
+        title_suffix = ""
+    else:
+        label, color = METHOD_STYLES.get(method_filter, (method_filter, "tab:gray"))
+        specs = [(method_filter, color, 0.9, 16)]
+        title_suffix = f" + {label}"
+
+    # Draw natural points first, then method points on top
+    plt.figure(figsize=(12, 8))
+    if fitness_vals is not None and len(fitness_vals) == len(natural_d):
+        scatter = plt.scatter(
+            natural_d["x"],
+            natural_d["y"],
+            c=fitness_vals,
+            cmap="viridis",
+            alpha=0.2,
+            s=10,
+            label="natural",
+            edgecolors="none",
+            zorder=1,
+        )
+        cbar = plt.colorbar(scatter)
+        cbar.set_label("Fluorescence", rotation=270, labelpad=20)
+    else:
+        plt.scatter(
+            natural_d["x"],
+            natural_d["y"],
+            c="lightgray",
+            alpha=0.15,
+            s=8,
+            label="natural",
+            edgecolors="none",
+            zorder=1,
+        )
+
+    for src, c, a, s in specs:
+        d = umap_df[umap_df["source"] == src]
+        plt.scatter(d["x"], d["y"], c=c, alpha=a, s=s, label=src, edgecolors="none", zorder=2)
+
+    plt.title(f"Latent Space UMAP (Natural = Fluorescence Heatmap{title_suffix})")
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(results_dir / "plot_umap_latent_space.png", dpi=220)
+    plt.savefig(results_dir / "plot_umap_latent_space_heatmap.png", dpi=220)
+    plt.close()
+
+    plt.figure(figsize=(12, 8))
+    plt.scatter(
+        natural_d["x"],
+        natural_d["y"],
+        c="lightgray",
+        alpha=0.15,
+        s=8,
+        label="natural",
+        edgecolors="none",
+        zorder=1,
+    )
+    for src, c, a, s in specs:
+        d = umap_df[umap_df["source"] == src]
+        plt.scatter(d["x"], d["y"], c=c, alpha=a, s=s, label=src, edgecolors="none", zorder=2)
+    plt.title(f"Latent Space UMAP (Natural = Gray{title_suffix})")
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(results_dir / "plot_umap_latent_space_no_heatmap.png", dpi=220)
+    plt.close()
+
+
+def _hamming_lenient(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    return sum(ch1 != ch2 for ch1, ch2 in zip(a[:n], b[:n])) + abs(len(a) - len(b))
+
+
+def plot_nearest_holdout_hamming_vs_fluorescence(
+    generated_df: pd.DataFrame,
+    holdout_df: pd.DataFrame,
+    holdout_seq_col: str,
+    holdout_fit_col: str,
+    results_dir: Path,
+) -> None:
+    hold_seqs = [clean_seq(str(s)) for s in holdout_df[holdout_seq_col].tolist()]
+    hold_fits = holdout_df[holdout_fit_col].astype(float).tolist()
+
+    rows = []
+    for _, row in generated_df.iterrows():
+        gseq = clean_seq(str(row["sequence"]))
+        dists = [_hamming_lenient(gseq, hseq) for hseq in hold_seqs]
+        best_idx = int(np.argmin(dists))
+        rows.append(
+            {
+                "method_name": row["method_name"],
+                "generated_sequence": gseq,
+                "nearest_holdout_sequence": hold_seqs[best_idx],
+                "min_hamming_to_holdout": int(dists[best_idx]),
+                "nearest_holdout_fluorescence": float(hold_fits[best_idx]),
+            }
+        )
+
+    nearest_df = pd.DataFrame(rows)
+    nearest_df.to_csv(results_dir / "nearest_holdout_hamming.csv", index=False)
+
+    plt.figure(figsize=(9, 7))
+    for m, c in [("baseline_pldm", "tab:orange"), ("ess", "tab:blue"), ("tess", "tab:red")]:
+        d = nearest_df[nearest_df["method_name"] == m]
+        if len(d) > 0:
+            plt.scatter(
+                d["min_hamming_to_holdout"],
+                d["nearest_holdout_fluorescence"],
+                c=c,
+                alpha=0.7,
+                s=18,
+                label=m,
+            )
+    plt.xlabel("Minimum Hamming distance to held-out set")
+    plt.ylabel("Fluorescence of nearest held-out protein")
+    plt.title("Generated Proteins: Nearest Held-out Fluorescence vs Hamming Distance")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(results_dir / "plot_nearest_holdout_hamming_vs_fluorescence.png", dpi=220)
+    plt.close()
+
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
@@ -113,6 +386,7 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     proldm_root = (script_dir / args.proldm_root).resolve()
     train_csv = (proldm_root / args.train_csv).resolve()
+    test_csv = (proldm_root / args.test_csv).resolve()
     ae_ckpt = (proldm_root / args.ae_ckpt).resolve()
     common_dir = (script_dir / args.common_dir).resolve()
     results_dir = (script_dir / args.results_dir).resolve()
@@ -121,12 +395,13 @@ def main() -> None:
     baseline_csv = (script_dir / args.baseline_results).resolve()
     ess_csv = (script_dir / args.ess_results).resolve()
     tess_csv = (script_dir / args.tess_results).resolve()
-    for p in [train_csv, ae_ckpt, baseline_csv, ess_csv, tess_csv]:
+    for p in [train_csv, test_csv, ae_ckpt, baseline_csv, ess_csv, tess_csv]:
         if not p.exists():
             raise FileNotFoundError(p)
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     train_df = pd.read_csv(train_csv)
+    test_df = pd.read_csv(test_csv)
     wt_seq = choose_wt(train_df)
     seq_col = infer_seq_col(train_df)
 
@@ -215,10 +490,13 @@ def main() -> None:
         ]
     )
     table.to_csv(results_dir / "table_fitness_fidelity_benchmark.csv", index=False)
-    (results_dir / "table_fitness_fidelity_benchmark.md").write_text(table.to_markdown(index=False), encoding="utf-8")
+    (results_dir / "table_fitness_fidelity_benchmark.md").write_text(dataframe_to_markdown(table), encoding="utf-8")
 
-    # UMAP
-    train_sample = train_df.sample(min(args.umap_train_samples, len(train_df)), random_state=args.seed)
+    # UMAP (default: use all natural points; set --umap-train-samples > 0 to subsample)
+    if args.umap_train_samples is not None and args.umap_train_samples > 0:
+        train_sample = train_df.sample(min(args.umap_train_samples, len(train_df)), random_state=args.seed)
+    else:
+        train_sample = train_df
     z_train = encode(model, [str(s) for s in train_sample[seq_col].tolist()], dims["seq_len"], device, args.batch_size)
     z_baseline = encode(model, baseline["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
     z_ess = encode(model, ess["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
@@ -226,21 +504,30 @@ def main() -> None:
     all_z = torch.cat([z_train, z_baseline, z_ess, z_tess], dim=0).numpy()
     emb = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.1, random_state=args.seed).fit_transform(all_z)
     sources = ["natural"] * len(z_train) + ["baseline_pldm"] * len(z_baseline) + ["ess"] * len(z_ess) + ["tess"] * len(z_tess)
+    
+    # Extract fluorescence values for natural proteins
+    fit_col = infer_fitness_col(train_sample)
+    fitness_vals = train_sample[fit_col].values if fit_col is not None else None
+    
     umap_df = pd.DataFrame({"x": emb[:, 0], "y": emb[:, 1], "source": sources})
     umap_df.to_csv(results_dir / "umap_points.csv", index=False)
 
-    plt.figure(figsize=(10, 8))
-    legend_specs = [("natural", "lightgray", 0.3, 8), ("baseline_pldm", "tab:blue", 0.8, 14), ("ess", "tab:orange", 0.8, 14), ("tess", "tab:green", 0.8, 14)]
-    for src, c, a, s in legend_specs:
-        d = umap_df[umap_df["source"] == src]
-        plt.scatter(d["x"], d["y"], c=c, alpha=a, s=s, label=src)
-    plt.title("Latent Space UMAP")
-    plt.xlabel("UMAP-1")
-    plt.ylabel("UMAP-2")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(results_dir / "plot_umap_latent_space.png", dpi=220)
-    plt.close()
+    plot_umap_views(umap_df=umap_df, fitness_vals=fitness_vals, results_dir=results_dir)
+
+    # Additional quality diagnostics
+    plot_stability_fitness(combined, results_dir)
+    plot_perplexity_histogram(combined, results_dir)
+    plot_aa_propensity_heatmap(combined, results_dir)
+    holdout_seq_col = infer_seq_col(test_df)
+    holdout_fit_col = infer_fitness_col(test_df)
+    if holdout_fit_col is not None:
+        plot_nearest_holdout_hamming_vs_fluorescence(
+            generated_df=combined,
+            holdout_df=test_df,
+            holdout_seq_col=holdout_seq_col,
+            holdout_fit_col=holdout_fit_col,
+            results_dir=results_dir,
+        )
 
     # Pareto
     if "esm2_fitness" in combined.columns and not combined["esm2_fitness"].isna().all():
@@ -257,8 +544,8 @@ def main() -> None:
         plt.close()
 
     # KL
-    fit_col = infer_fitness_col(train_df)
-    holdout = train_df.nlargest(100, fit_col) if fit_col is not None else train_df.head(100)
+    fit_col = infer_fitness_col(test_df)
+    holdout = test_df.nlargest(100, fit_col) if fit_col is not None else test_df.head(100)
     hold_dist = aa_distribution([clean_seq(str(s)) for s in holdout[seq_col].tolist()])
     kl_vals = {
         "baseline_pldm": dkl(aa_distribution(baseline["sequence"].tolist()), hold_dist),
@@ -272,7 +559,7 @@ def main() -> None:
     for bar, lab in zip(bars, labels):
         bar.set_label(lab)
     plt.legend()
-    plt.ylabel("DKL to top-100 natural holdout")
+    plt.ylabel("DKL to top-100 natural test holdout")
     plt.title("KL-Divergence Bar Chart")
     plt.tight_layout()
     plt.savefig(results_dir / "plot_kl_divergence.png", dpi=220)
@@ -290,6 +577,62 @@ def main() -> None:
         plt.legend()
         plt.tight_layout()
         plt.savefig(results_dir / "plot_pearson_esm2_vs_pldm.png", dpi=220)
+        plt.close()
+
+    # Method-specific plot directories and plot variants
+    method_dirs: Dict[str, Path] = {}
+    for method_name in METHOD_STYLES:
+        method_dir = results_dir / method_name
+        method_dir.mkdir(parents=True, exist_ok=True)
+        method_dirs[method_name] = method_dir
+
+    for method_name, (method_label, method_color) in METHOD_STYLES.items():
+        method_df = combined[combined["method_name"] == method_name].copy()
+        method_dir = method_dirs[method_name]
+
+        plot_umap_views(umap_df=umap_df, fitness_vals=fitness_vals, results_dir=method_dir, method_filter=method_name)
+        plot_stability_fitness(method_df, method_dir)
+        plot_perplexity_histogram(method_df, method_dir)
+        plot_aa_propensity_heatmap_single(method_df, method_dir, method_name)
+
+        if holdout_fit_col is not None:
+            plot_nearest_holdout_hamming_vs_fluorescence(
+                generated_df=method_df,
+                holdout_df=test_df,
+                holdout_seq_col=holdout_seq_col,
+                holdout_fit_col=holdout_fit_col,
+                results_dir=method_dir,
+            )
+
+        if "esm2_fitness" in method_df.columns and not method_df["esm2_fitness"].isna().all():
+            plt.figure(figsize=(9, 7))
+            d = method_df
+            plt.scatter(d["sequence_identity_wt"], d["esm2_fitness"], c=method_color, alpha=0.8, s=18, label=method_name)
+            plt.xlabel("Sequence Identity to WT")
+            plt.ylabel("ESM-2 Fitness")
+            plt.title(f"Identity vs Fitness Pareto Front ({method_label})")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(method_dir / "plot_identity_vs_fitness_pareto.png", dpi=220)
+            plt.close()
+
+            plt.figure(figsize=(8, 6))
+            plt.scatter(d["esm2_fitness"], d["pldm_regressor_score"], c=method_color, alpha=0.7, s=16, label=method_name)
+            plt.xlabel("ESM-2 score")
+            plt.ylabel("PRO-LDM regressor score")
+            plt.title(f"Pearson Correlation Plot ({method_label})")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(method_dir / "plot_pearson_esm2_vs_pldm.png", dpi=220)
+            plt.close()
+
+        method_kl = dkl(aa_distribution(method_df["sequence"].tolist()), hold_dist)
+        plt.figure(figsize=(8, 6))
+        plt.bar([method_name], [method_kl], color=[method_color])
+        plt.ylabel("DKL to top-100 natural test holdout")
+        plt.title(f"KL-Divergence Bar Chart ({method_label})")
+        plt.tight_layout()
+        plt.savefig(method_dir / "plot_kl_divergence.png", dpi=220)
         plt.close()
 
     summary = {

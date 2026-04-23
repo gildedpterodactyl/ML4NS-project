@@ -17,9 +17,8 @@ fi
 mkdir -p tess/results
 uv run --no-sync python evaluate_method.py \
   --method tess \
-  --input tess/outputs/results.csv \
-  --output tess/results/results.csv \
-  --max-structure 50 \
+  --input-csv tess/outputs/results_tess.csv \
+  --results-csv tess/results/results.csv \
   --use-esm2 "${USE_ESM2}" \
   --proldm-root ../PROLDM_OUTLIER \
   --dataset GFP

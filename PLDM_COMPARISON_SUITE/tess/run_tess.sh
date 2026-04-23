@@ -5,10 +5,13 @@ cd "$(dirname "$0")/.."
 
 N="${N:-1000}"
 DEVICE="${DEVICE:-cpu}"
-WITH_STRUCTURE="${WITH_STRUCTURE:-false}"
-ESM_WEIGHT="${ESM_WEIGHT:-0.6}"
-REG_WEIGHT="${REG_WEIGHT:-0.4}"
-TESS_DELTA="${TESS_DELTA:-6.0}"
+WITH_STRUCTURE="${WITH_STRUCTURE:-true}"
+ESM_WEIGHT="${ESM_WEIGHT:-0.5}"
+REG_WEIGHT="${REG_WEIGHT:-0.5}"
+ALPHA="${ALPHA:-0.5}"
+TESS_DELTA="${TESS_DELTA:-0.14}"
+TESS_WARP_STRENGTH="${TESS_WARP_STRENGTH:-0.75}"
+LATENT_TEMPERATURE="${LATENT_TEMPERATURE:-0.75}"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/$USER/uv-cache}"
 export TMPDIR="${TMPDIR:-/tmp/$USER/tmp}"
@@ -33,6 +36,9 @@ uv run --no-sync python generate_sequences.py \
   --burnin 20 \
   --max-steps 5000 \
   --tess-delta "${TESS_DELTA}" \
+  --tess-warp-strength "${TESS_WARP_STRENGTH}" \
+  --alpha "${ALPHA}" \
+  --latent-temperature "${LATENT_TEMPERATURE}" \
   --esm-weight "${ESM_WEIGHT}" \
   --reg-weight "${REG_WEIGHT}" \
   --device "${DEVICE}" \

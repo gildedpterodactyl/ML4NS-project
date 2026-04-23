@@ -21,6 +21,7 @@ mkdir -p common/results
 uv run --no-sync python merge_and_plot.py \
   --proldm-root ../PROLDM_OUTLIER \
   --train-csv data/mut_data/GFP-train.csv \
+  --test-csv data/mut_data/GFP-test.csv \
   --ae-ckpt train_logs/GFP/epoch_1000.pt \
   --dataset GFP \
   --baseline-results baseline/results/results.csv \

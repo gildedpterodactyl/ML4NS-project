@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 
 N="${N:-50}"
 DEVICE="${DEVICE:-cpu}"
+BASELINE_MODEL_TYPE="${BASELINE_MODEL_TYPE:-tiny}"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/$USER/uv-cache}"
 export TMPDIR="${TMPDIR:-/tmp/$USER/tmp}"
@@ -21,6 +22,7 @@ uv run --no-sync python generate_sequences.py \
   --proldm-root ../PROLDM_OUTLIER \
   --train-csv data/mut_data/GFP-train.csv \
   --baseline-ckpt train_logs/GFP/dropout_tiny_epoch_1000.pt \
+  --baseline-model-type "${BASELINE_MODEL_TYPE}" \
   --dataset GFP \
   --n "${N}" \
   --omega 20.0 \

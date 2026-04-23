@@ -237,6 +237,19 @@ def parse_ca_coords_from_pdb(path: Path) -> np.ndarray:
     return np.asarray(coords, dtype=np.float64)
 
 
+def pdb_mean_plddt(pdb_text: str) -> float:
+    vals = []
+    for line in pdb_text.splitlines():
+        if line.startswith("ATOM"):
+            try:
+                vals.append(float(line[60:66].strip()))
+            except ValueError:
+                continue
+    if len(vals) == 0:
+        return float("nan")
+    return float(np.mean(vals))
+
+
 def kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
     n = min(len(P), len(Q))
     if n == 0:
