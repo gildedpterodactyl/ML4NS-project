@@ -1,0 +1,33 @@
+{
+  "proldm_root": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/PROLDM_OUTLIER",
+  "checkpoint": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/PROLDM_OUTLIER/train_logs/GFP/epoch_1000.pt",
+  "input_csv": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/PROLDM_OUTLIER/data/mut_data/GFP-train.csv",
+  "num_rows": 2,
+  "missing_keys": [],
+  "unexpected_keys": [],
+  "args": {
+    "proldm_root": "../PROLDM_OUTLIER",
+    "checkpoint": "train_logs/GFP/epoch_1000.pt",
+    "input_csv": "data/mut_data/GFP-train.csv",
+    "dataset": "GFP",
+    "seq_len": 0,
+    "latent_dim": 0,
+    "batch_size": 8,
+    "guidance": "esm2",
+    "esm2_model": "facebook/esm2_t6_8M_UR50D",
+    "esm2_head_path": null,
+    "num_samples": 2,
+    "num_chains": 1,
+    "burnin": 1,
+    "thin": 1,
+    "max_steps_per_chain": 10,
+    "start_mode": "wildtype",
+    "start_index": 0,
+    "use_tess": false,
+    "delta": 12.0,
+    "device": "cuda",
+    "seed": 42,
+    "output_csv": "generated_seq/tfg_esm2_smoke.csv",
+    "output_json": "generated_seq/tfg_esm2_smoke_meta.json"
+  }
+}

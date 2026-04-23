@@ -33,6 +33,8 @@ class BaseVAE(LightningModule):
         Ki: float = 0.0001,
         lr: float = 0.001,
         reduction: str = "sum",
+        interp_weight: float = 0.0,
+        latent_weight: float = 0.0,
     ):
         super(BaseVAE, self).__init__()
 
@@ -132,7 +134,8 @@ class BaseVAE(LightningModule):
 
     def loss_function(self, pred_seq: torch.Tensor, target_seq: torch.Tensor,
                       pred_prop: torch.Tensor, target_prob: torch.Tensor,
-                      mu: torch.Tensor, logvar: torch.Tensor):
+                      mu: torch.Tensor, logvar: torch.Tensor,
+                      latent: torch.Tensor = None):
         """Measure loss and control kl weight
 
         Args:
@@ -142,12 +145,15 @@ class BaseVAE(LightningModule):
             target_prob (torch.Tensor): target property values of shape `[batch, 1]`
             mu (torch.Tensor): mean of latent z of shape `[batch, latent_dim]`
             logvar (torch.Tensor): log-variance of latent z of shape `[batch, latent_dim]`
+            latent (torch.Tensor): sampled latent z of shape `[batch, latent_dim]`
 
         Returns:
             total_loss (torch.Tensor): total loss, scalar
             kl_loss (Tensor): Kullback-Leibler divergence, scalar
             recon_loss (Tensor): reconstruction loss, scalar
             mse_loss (Tensor): MSE loss, scalar
+            interp_loss (Tensor): interpolation smoothness loss, scalar
+            latent_loss (Tensor): latent norm regularization loss, scalar
         """
         # KL divergence
         kl_loss = self.kl_div(mu, logvar)
@@ -158,15 +164,41 @@ class BaseVAE(LightningModule):
         # MSE (predictor) loss
         mse_loss = self.mse_loss(pred_prop, target_prob)
 
+        # Latent regularization
+        if self.hparams.latent_weight > 0 and latent is not None:
+            latent_loss = 0.5 * torch.linalg.vector_norm(latent, 2, dim=1) ** 2
+            latent_loss = latent_loss.mean() if self.hparams.reduction == "mean" else latent_loss.sum()
+        else:
+            latent_loss = 0.0
+
+        # Interpolation-style smoothness regularization
+        if self.hparams.interp_weight > 0 and latent is not None:
+            bs = latent.size(0)
+            if bs > 1:
+                z_pairs = latent.reshape(-1, 1, latent.shape[-1]) - latent.reshape(1, -1, latent.shape[-1])
+                z_dist = torch.norm(z_pairs, p=2, dim=-1)
+                z_dist_nonzero = z_dist[z_dist > 0]
+                if z_dist_nonzero.numel() > 0:
+                    z_dist_median = torch.median(z_dist_nonzero)
+                    interp_loss = torch.relu(z_dist - 2.0 * z_dist_median).mean()
+                else:
+                    interp_loss = 0.0
+            else:
+                interp_loss = 0.0
+        else:
+            interp_loss = 0.0
+
         total_loss = self.hparams.kl_weight * kl_loss \
             + self.hparams.nll_weight * recon_loss \
-            + self.hparams.mse_weight * mse_loss
+            + self.hparams.mse_weight * mse_loss \
+            + self.hparams.interp_weight * interp_loss \
+            + self.hparams.latent_weight * latent_loss
 
         if self.training:
             # Control kl weight
             self.hparams.kl_weight = self.pi_controller(kl_loss.detach())
 
-        return total_loss, kl_loss, recon_loss, mse_loss
+        return total_loss, kl_loss, recon_loss, mse_loss, interp_loss, latent_loss
 
     def predict_property_from_latent(self, mu: torch.Tensor) -> float:
         return self.predictor(mu)
@@ -174,15 +206,15 @@ class BaseVAE(LightningModule):
     def model_step(self, batch):
         x, y = batch["sequences"], batch["fitness"]
         y = y.unsqueeze(1)
-        dec_probs, pred_property, mu, logvar, seqs_ids, *_ = self.forward(x)
+        dec_probs, pred_property, mu, logvar, seqs_ids, latent = self.forward(x)
 
-        loss, kl_loss, recon_loss, mse_loss = \
-            self.loss_function(dec_probs, seqs_ids, pred_property, y, mu, logvar)
+        loss, kl_loss, recon_loss, mse_loss, interp_loss, latent_loss = \
+            self.loss_function(dec_probs, seqs_ids, pred_property, y, mu, logvar, latent)
 
-        return loss, kl_loss, recon_loss, mse_loss
+        return loss, kl_loss, recon_loss, mse_loss, interp_loss, latent_loss
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        loss, kl_loss, recon_loss, mse_loss = self.model_step(batch)
+        loss, kl_loss, recon_loss, mse_loss, interp_loss, latent_loss = self.model_step(batch)
 
         # update and log metrics
         self.train_total_loss(loss)
@@ -198,13 +230,15 @@ class BaseVAE(LightningModule):
                  on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train_mse", self.train_mse_loss, on_step=True,
                  on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_interp_loss", interp_loss, on_step=False, on_epoch=True)
+        self.log("train_latent_loss", latent_loss, on_step=False, on_epoch=True)
         self.log("train_kl_weight", self.hparams.kl_weight, on_step=True,
                  on_epoch=False, prog_bar=True, sync_dist=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        loss, kl_loss, recon_loss, mse_loss = self.model_step(batch)
+        loss, kl_loss, recon_loss, mse_loss, interp_loss, latent_loss = self.model_step(batch)
 
         # update and log metrics
         self.valid_total_loss(loss)

@@ -1,0 +1,137 @@
+{
+    "os": "Linux-6.18.1-arch1-2-x86_64-with-glibc2.42",
+    "python": "3.10.19",
+    "heartbeatAt": "2026-04-19T07:01:11.398472",
+    "startedAt": "2026-04-19T07:01:11.318813",
+    "docker": null,
+    "cuda": null,
+    "args": [
+        "/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/scripts/configs/_auto_rnn_smooth.py",
+        "--csv_file=/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/preprocessed_data/avGFP/avGFP.csv",
+        "--expected_kl=25",
+        "--batch_size=32",
+        "--devices=0",
+        "--epochs=1",
+        "--seed=42",
+        "--prefix=smoke_gpu1"
+    ],
+    "state": "running",
+    "program": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/scripts/train_vae.py",
+    "codePathLocal": "scripts/train_vae.py",
+    "codePath": "LatentDE/scripts/train_vae.py",
+    "git": {
+        "remote": "https://github.com/gildedpterodactyl/ML4NS-project.git",
+        "commit": "fcd2f2a21be978ed128c481019c7e74c82a487d4"
+    },
+    "email": "rohitjeswanth@gmail.com",
+    "root": "/home/rohitj/Documents/courses/MLNS/ML4NS-project",
+    "host": "prometheus",
+    "username": "rohitj",
+    "executable": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/.venv/bin/python",
+    "cpu_count": 12,
+    "cpu_count_logical": 16,
+    "cpu_freq": {
+        "current": 1498.5471249999998,
+        "min": 400.0,
+        "max": 3900.0
+    },
+    "cpu_freq_per_core": [
+        {
+            "current": 944.876,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 787.782,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 3106.087,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 400.0,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 1299.07,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 400.0,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 2766.609,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 400.0,
+            "min": 400.0,
+            "max": 4500.0
+        },
+        {
+            "current": 399.942,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 1451.112,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 1981.493,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 399.918,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 1944.885,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 1818.216,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 931.61,
+            "min": 400.0,
+            "max": 3300.0
+        },
+        {
+            "current": 400.0,
+            "min": 400.0,
+            "max": 3300.0
+        }
+    ],
+    "disk": {
+        "/": {
+            "total": 190.2268829345703,
+            "used": 80.91143035888672
+        }
+    },
+    "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "gpu_count": 1,
+    "gpu_devices": [
+        {
+            "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+            "memory_total": 4294967296
+        }
+    ],
+    "memory": {
+        "total": 15.304080963134766
+    }
+}

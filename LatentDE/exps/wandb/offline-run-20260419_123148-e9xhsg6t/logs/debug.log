@@ -1,0 +1,25 @@
+2026-04-19 12:31:48,944 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Current SDK version is 0.16.1
+2026-04-19 12:31:48,944 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Configure stats pid to 16179
+2026-04-19 12:31:48,944 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Loading settings from /home/rohitj/.config/wandb/settings
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Loading settings from /home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/wandb/settings
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Loading settings from environment variables: {'mode': 'offline'}
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Applying setup settings: {'_disable_service': False}
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_setup.py:_flush():76] Inferring run settings from compute environment: {'program_relpath': 'LatentDE/scripts/train_vae.py', 'program_abspath': '/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/scripts/train_vae.py', 'program': '/home/rohitj/Documents/courses/MLNS/ML4NS-project/LatentDE/scripts/train_vae.py'}
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:_log_setup():524] Logging user logs to ./exps/wandb/offline-run-20260419_123148-e9xhsg6t/logs/debug.log
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:_log_setup():525] Logging internal logs to ./exps/wandb/offline-run-20260419_123148-e9xhsg6t/logs/debug-internal.log
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:init():564] calling init triggers
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:init():571] wandb.init called with sweep_config: {}
+config: {}
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:init():614] starting backend
+2026-04-19 12:31:48,945 INFO    MainThread:16179 [wandb_init.py:init():618] setting up manager
+2026-04-19 12:31:48,946 INFO    MainThread:16179 [backend.py:_multiprocessing_setup():105] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2026-04-19 12:31:48,947 INFO    MainThread:16179 [wandb_init.py:init():624] backend started and connected
+2026-04-19 12:31:48,948 INFO    MainThread:16179 [wandb_init.py:init():716] updated telemetry
+2026-04-19 12:31:48,951 INFO    MainThread:16179 [wandb_init.py:init():749] communicating run to backend with 90.0 second timeout
+2026-04-19 12:31:48,955 INFO    MainThread:16179 [wandb_init.py:init():800] starting run threads in backend
+2026-04-19 12:31:49,033 INFO    MainThread:16179 [wandb_run.py:_console_start():2233] atexit reg
+2026-04-19 12:31:49,033 INFO    MainThread:16179 [wandb_run.py:_redirect():2088] redirect: wrap_raw
+2026-04-19 12:31:49,033 INFO    MainThread:16179 [wandb_run.py:_redirect():2153] Wrapping output streams.
+2026-04-19 12:31:49,033 INFO    MainThread:16179 [wandb_run.py:_redirect():2178] Redirects installed.
+2026-04-19 12:31:49,034 INFO    MainThread:16179 [wandb_init.py:init():841] run started, returning control to user process
+2026-04-19 12:31:50,393 INFO    MainThread:16179 [wandb_run.py:_config_callback():1342] config_cb None None {'expected_kl': 25.0, 'pretrained_encoder_path': 'facebook/esm2_t30_150M_UR50D', 'latent_dim': 320, 'pred_hidden_dim': 512, 'pred_dropout': 0.2, 'nll_weight': 1.0, 'mse_weight': 1.0, 'kl_weight': 1.0, 'beta_min': 0.0, 'beta_max': 1.0, 'Kp': 0.01, 'Ki': 0.0001, 'lr': 0.0002, 'reduction': 'mean', 'interp_weight': 0.01, 'latent_weight': 0.01, 'upsampler_max_filter': 512, 'upsampler_kernel_size': 2, 'upsampler_low_res_dim': 30, 'upsampler_min_deconv_dim': 32, 'upsampler_num_deconv_layers': 3, 'upsampler_stride': 2, 'upsampler_padding': 0, 'upsampler_dropout': 0.2, 'upsampler_act_type': 'relu', 'dec_hidden_dim': 512, 'dec_num_layers': 1, 'dec_attn_method': 'general', 'use_teacher_forcing': 0.5, 'inp_dropout': 0.4, 'gru_dropout': 0.0, 'max_len': 240, 'neg_floor': 1.28341923933}

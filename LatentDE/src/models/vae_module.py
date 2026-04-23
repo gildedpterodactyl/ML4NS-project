@@ -41,11 +41,15 @@ class GruVAE(BaseVAE):
         lr: float = 0.001,
         device: Union[torch.device, str] = "cuda",
         reduction: str = "sum",
+        interp_weight: float = 0.0,
+        latent_weight: float = 0.0,
+        neg_floor: float = None,
     ):
         super(GruVAE, self).__init__(
             expected_kl, pretrained_encoder_path, latent_dim,
             pred_hidden_dim, pred_dropout, nll_weight, mse_weight,
             kl_weight, beta_min, beta_max, Kp, Ki, lr, reduction,
+            interp_weight, latent_weight,
         )
 
         self.save_hyperparameters(ignore=["device"])
@@ -150,11 +154,14 @@ class CNNVAE(BaseVAE):
         device: Union[torch.device, str] = "cuda",
         reduction: str = "sum",
         neg_floor: float = None,
+        interp_weight: float = 0.0,
+        latent_weight: float = 0.0,
     ):
         super(CNNVAE, self).__init__(
             expected_kl, pretrained_encoder_path, latent_dim,
             pred_hidden_dim, pred_dropout, nll_weight, mse_weight,
             kl_weight, beta_min, beta_max, Kp, Ki, lr, reduction,
+            interp_weight, latent_weight,
         )
 
         # Decoder

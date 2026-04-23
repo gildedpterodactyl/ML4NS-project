@@ -1,6 +1,10 @@
 # Local generated artifacts
 LatentDE/.project-root
 LatentDE/**/__pycache__/
+LatentDE/**/.venv/
+LatentDE/**/uv.lock
 LatentDE/**/*.py[cod]
 LatentDE/wandb/
 landscape_params/
+
+PROLDM_OUTLIER/*

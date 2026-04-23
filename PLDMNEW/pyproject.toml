@@ -1,0 +1,32 @@
+[project]
+name = "pldmnew-tfg"
+version = "0.1.0"
+description = "ESS/TESS latent generation for PROLDM JTAE source space"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "torch>=2.6",
+  "transformers>=4.40",
+  "sentencepiece>=0.2.0",
+  "matplotlib>=3.8",
+  "scipy>=1.11",
+  "scikit-learn>=1.4",
+  "umap-learn>=0.5.6",
+  "biopython>=1.84",
+  "tmtools>=0.2.0",
+  "fair-esm>=2.0.0",
+  "omegaconf>=2.3.0",
+  "wandb>=0.17",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
