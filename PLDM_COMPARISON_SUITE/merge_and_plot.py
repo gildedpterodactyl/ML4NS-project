@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results-dir", type=str, default="common/results")
     p.add_argument("--esm2-model", type=str, default="facebook/esm2_t6_8M_UR50D")
     p.add_argument("--esm2-head-path", type=str, default=None)
+    p.add_argument("--use-esm2", type=str2bool, default=False)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--with-structure", type=str2bool, default=False)
     p.add_argument("--wt-pdb", type=str, default="1GFL")
@@ -141,7 +142,7 @@ def main() -> None:
     model.load_state_dict(filter_by_shape(state, model.state_dict()), strict=False)
     model.eval()
 
-    esm2 = ESM2Scorer(args.esm2_model, device, args.esm2_head_path)
+    esm2 = ESM2Scorer(args.esm2_model, device, args.esm2_head_path) if args.use_esm2 else None
 
     baseline = load_method_csv(baseline_csv)
     ess = load_method_csv(ess_csv)
@@ -151,7 +152,11 @@ def main() -> None:
     combined.to_csv(results_dir / "combined_results.csv", index=False)
 
     # Benchmark table
-    wt_score, _ = esm2.score_and_perplexity([wt_seq])
+    if esm2 is not None:
+        wt_score, _ = esm2.score_and_perplexity([wt_seq])
+        wt_score_val = float(wt_score.detach().cpu().item())
+    else:
+        wt_score_val = float("nan")
     with torch.no_grad():
         wt_z = encode(model, [wt_seq], dims["seq_len"], device, args.batch_size).to(device)
         wt_reg = model.regressor_module(wt_z).squeeze(-1).detach().cpu().item()
@@ -174,7 +179,7 @@ def main() -> None:
             {
                 "Method": "Natural (WT)",
                 "Target Label": "N/A",
-                "ESM-2 Score": float(wt_score.detach().cpu().item()),
+                "ESM-2 Score": wt_score_val,
                 "PRO-LDM Score": wt_reg,
                 "Avg. pLDDT": wt_plddt,
                 "Mean Identity": 1.0,
@@ -183,7 +188,7 @@ def main() -> None:
             {
                 "Method": "PRO-LDM (ω=20)",
                 "Target Label": 8,
-                "ESM-2 Score": float(baseline["esm2_fitness"].mean()),
+                "ESM-2 Score": float(baseline["esm2_fitness"].mean()) if "esm2_fitness" in baseline.columns else float("nan"),
                 "PRO-LDM Score": float(baseline["pldm_regressor_score"].mean()),
                 "Avg. pLDDT": float(baseline["plddt_score"].mean()),
                 "Mean Identity": float(baseline["sequence_identity_wt"].mean()),
@@ -192,7 +197,7 @@ def main() -> None:
             {
                 "Method": "ESS (TFG)",
                 "Target Label": "N/A",
-                "ESM-2 Score": float(ess["esm2_fitness"].mean()),
+                "ESM-2 Score": float(ess["esm2_fitness"].mean()) if "esm2_fitness" in ess.columns else float("nan"),
                 "PRO-LDM Score": float(ess["pldm_regressor_score"].mean()),
                 "Avg. pLDDT": float(ess["plddt_score"].mean()),
                 "Mean Identity": float(ess["sequence_identity_wt"].mean()),
@@ -201,7 +206,7 @@ def main() -> None:
             {
                 "Method": "TESS (TFG)",
                 "Target Label": "N/A",
-                "ESM-2 Score": float(tess["esm2_fitness"].mean()),
+                "ESM-2 Score": float(tess["esm2_fitness"].mean()) if "esm2_fitness" in tess.columns else float("nan"),
                 "PRO-LDM Score": float(tess["pldm_regressor_score"].mean()),
                 "Avg. pLDDT": float(tess["plddt_score"].mean()),
                 "Mean Identity": float(tess["sequence_identity_wt"].mean()),
@@ -238,17 +243,18 @@ def main() -> None:
     plt.close()
 
     # Pareto
-    plt.figure(figsize=(9, 7))
-    for m, c in [("baseline_pldm", "tab:blue"), ("ess", "tab:orange"), ("tess", "tab:green")]:
-        d = combined[combined["method_name"] == m]
-        plt.scatter(d["sequence_identity_wt"], d["esm2_fitness"], c=c, alpha=0.7, s=16, label=m)
-    plt.xlabel("Sequence Identity to WT")
-    plt.ylabel("ESM-2 Fitness")
-    plt.title("Identity vs Fitness Pareto Front")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(results_dir / "plot_identity_vs_fitness_pareto.png", dpi=220)
-    plt.close()
+    if "esm2_fitness" in combined.columns and not combined["esm2_fitness"].isna().all():
+        plt.figure(figsize=(9, 7))
+        for m, c in [("baseline_pldm", "tab:blue"), ("ess", "tab:orange"), ("tess", "tab:green")]:
+            d = combined[combined["method_name"] == m]
+            plt.scatter(d["sequence_identity_wt"], d["esm2_fitness"], c=c, alpha=0.7, s=16, label=m)
+        plt.xlabel("Sequence Identity to WT")
+        plt.ylabel("ESM-2 Fitness")
+        plt.title("Identity vs Fitness Pareto Front")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(results_dir / "plot_identity_vs_fitness_pareto.png", dpi=220)
+        plt.close()
 
     # KL
     fit_col = infer_fitness_col(train_df)
@@ -273,17 +279,18 @@ def main() -> None:
     plt.close()
 
     # Pearson
-    plt.figure(figsize=(8, 6))
-    for m, c in [("baseline_pldm", "tab:blue"), ("ess", "tab:orange"), ("tess", "tab:green")]:
-        d = combined[combined["method_name"] == m]
-        plt.scatter(d["esm2_fitness"], d["pldm_regressor_score"], c=c, alpha=0.6, s=14, label=m)
-    plt.xlabel("ESM-2 score")
-    plt.ylabel("PRO-LDM regressor score")
-    plt.title("Pearson Correlation Plot")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(results_dir / "plot_pearson_esm2_vs_pldm.png", dpi=220)
-    plt.close()
+    if "esm2_fitness" in combined.columns and not combined["esm2_fitness"].isna().all():
+        plt.figure(figsize=(8, 6))
+        for m, c in [("baseline_pldm", "tab:blue"), ("ess", "tab:orange"), ("tess", "tab:green")]:
+            d = combined[combined["method_name"] == m]
+            plt.scatter(d["esm2_fitness"], d["pldm_regressor_score"], c=c, alpha=0.6, s=14, label=m)
+        plt.xlabel("ESM-2 score")
+        plt.ylabel("PRO-LDM regressor score")
+        plt.title("Pearson Correlation Plot")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(results_dir / "plot_pearson_esm2_vs_pldm.png", dpi=220)
+        plt.close()
 
     summary = {
         "counts": {"baseline_pldm": int(len(baseline)), "ess": int(len(ess)), "tess": int(len(tess))},

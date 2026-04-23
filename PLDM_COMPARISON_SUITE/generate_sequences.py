@@ -42,7 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=str, default="GFP")
     p.add_argument("--esm2-model", type=str, default="facebook/esm2_t6_8M_UR50D")
     p.add_argument("--esm2-head-path", type=str, default=None)
-    p.add_argument("--n", type=int, default=1000)
+    p.add_argument("--use-esm2", type=str2bool, default=False)
+    p.add_argument("--n", type=int, default=50)
     p.add_argument("--num-chains", type=int, default=8)
     p.add_argument("--tess-delta", type=float, default=6.0)
     p.add_argument("--burnin", type=int, default=20)
@@ -121,6 +122,8 @@ class Likelihood:
     @torch.no_grad()
     def __call__(self, z: torch.Tensor) -> torch.Tensor:
         reg = self.ae.regressor_module(z).squeeze(-1)
+        if self.esm2 is None:
+            return reg
         seqs = self.decode_seq(z)
         esm, _ = self.esm2.score_and_perplexity(seqs)
         reg_z = (reg - reg.mean()) / reg.std(unbiased=False).clamp_min(1e-8)
@@ -237,7 +240,7 @@ def main() -> None:
     z_start = ae.encode(seq_to_inds(start_seq, dims["seq_len"]).unsqueeze(0).to(device)).squeeze(0).to(torch.float32)
     z_wt = ae.encode(seq_to_inds(wt_seq, dims["seq_len"]).unsqueeze(0).to(device)).squeeze(0).to(torch.float32)
 
-    esm2 = ESM2Scorer(args.esm2_model, device=device, head_path=args.esm2_head_path)
+    esm2 = ESM2Scorer(args.esm2_model, device=device, head_path=args.esm2_head_path) if args.use_esm2 else None
     ll = Likelihood(ae, esm2, dims["seq_len"], device, esm_w=args.esm_weight, reg_w=args.reg_weight)
 
     modes = [args.mode] if args.mode != "all" else ["baseline", "ess", "tess"]

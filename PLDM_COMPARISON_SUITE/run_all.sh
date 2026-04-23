@@ -4,11 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 WITH_STRUCTURE="${WITH_STRUCTURE:-false}"
-N="${N:-1000}"
+N="${N:-50}"
 DEVICE="${DEVICE:-cpu}"
 TESS_DELTA="${TESS_DELTA:-6.0}"
 ESM_WEIGHT="${ESM_WEIGHT:-0.6}"
 REG_WEIGHT="${REG_WEIGHT:-0.4}"
+USE_ESM2="${USE_ESM2:-false}"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/$USER/uv-cache}"
 export TMPDIR="${TMPDIR:-/tmp/$USER/tmp}"
@@ -16,10 +17,17 @@ export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/tmp/$USER/uv-venvs/pld
 mkdir -p "$UV_CACHE_DIR" "$TMPDIR"
 mkdir -p "$(dirname "$UV_PROJECT_ENVIRONMENT")"
 
-uv sync
 export SKIP_UV_SYNC=true
 
-bash baseline/run_baseline.sh
-bash ess/run_ess.sh
-bash tess/run_tess.sh
+uv sync
+
+bash baseline/generate_baseline.sh
+bash baseline/eval_baseline.sh
+
+bash ess/generate_ess.sh
+bash ess/eval_ess.sh
+
+bash tess/generate_tess.sh
+bash tess/eval_tess.sh
+
 bash common/run_common_plots.sh

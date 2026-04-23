@@ -50,10 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=str, default="GFP")
     p.add_argument("--esm2-model", type=str, default="facebook/esm2_t6_8M_UR50D")
     p.add_argument("--esm2-head-path", type=str, default=None)
+    p.add_argument("--use-esm2", type=str2bool, default=False)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--with-structure", type=str2bool, default=False)
     p.add_argument("--wt-pdb", type=str, default="1GFL")
-    p.add_argument("--structure-max-per-method", type=int, default=100)
+    p.add_argument("--structure-max-per-method", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -171,15 +172,19 @@ def main() -> None:
     with torch.no_grad():
         pldm = model.regressor_module(z).squeeze(-1).detach().cpu().numpy()
 
-    esm2 = ESM2Scorer(args.esm2_model, device, args.esm2_head_path)
-    esm_scores = []
-    perplexities = []
-    with torch.no_grad():
-        for i in range(0, len(seqs), args.batch_size):
-            chunk = seqs[i : i + args.batch_size]
-            s, p = esm2.score_and_perplexity(chunk)
-            esm_scores.extend(s.detach().cpu().tolist())
-            perplexities.extend(p.detach().cpu().tolist())
+    esm2 = ESM2Scorer(args.esm2_model, device, args.esm2_head_path) if args.use_esm2 else None
+    if esm2 is not None:
+        esm_scores = []
+        perplexities = []
+        with torch.no_grad():
+            for i in range(0, len(seqs), args.batch_size):
+                chunk = seqs[i : i + args.batch_size]
+                s, p = esm2.score_and_perplexity(chunk)
+                esm_scores.extend(s.detach().cpu().tolist())
+                perplexities.extend(p.detach().cpu().tolist())
+    else:
+        esm_scores = [np.nan] * len(seqs)
+        perplexities = [np.nan] * len(seqs)
 
     out = pd.DataFrame(
         {
