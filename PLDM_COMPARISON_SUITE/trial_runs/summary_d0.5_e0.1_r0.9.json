@@ -1,0 +1,14 @@
+{
+  "counts": {
+    "baseline_pldm": 50,
+    "ess": 50,
+    "tess": 50
+  },
+  "table_path": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/PLDM_COMPARISON_SUITE/common/results/table_fitness_fidelity_benchmark.csv",
+  "combined_csv": "/home/rohitj/Documents/courses/MLNS/ML4NS-project/PLDM_COMPARISON_SUITE/common/results/combined_results.csv",
+  "kl": {
+    "baseline_pldm": 0.00024150385784805866,
+    "ess": 0.33237207018578513,
+    "tess": 0.012101219373127433
+  }
+}
