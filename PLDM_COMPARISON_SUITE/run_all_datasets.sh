@@ -4,6 +4,18 @@
 # Run all 5 modes (baseline, ess, tess, transport_ess, ress) x all datasets,
 # then call merge_and_plot.py for combined plots.
 #
+# All outputs land under a timestamped run directory:
+#   results_<YYYYMMDD_HHMMSS>/
+#     baseline/
+#       outputs/<DATASET>/   ← raw generated CSVs
+#       results/<DATASET>/   ← evaluated results.csv + summary.json
+#     ess/          (same structure)
+#     tess/         (same structure)
+#     transport_ess/(same structure)
+#     ress/         (same structure)
+#     common/<DATASET>/results/  ← merged plots + tables
+#     results_summary.tsv        ← cross-method summary table
+#
 # MODE TAXONOMY (matches generate_sequences.py --mode flag):
 #   baseline      : PRO-LDM diffusion sampler (the paper's method, no MCMC)
 #   ess           : Elliptical Slice Sampling from top-fitness seed
@@ -17,10 +29,21 @@
 #   DATASETS="GFP" MODES="ess transport_ess" bash run_all_datasets.sh
 #   N=500 DEVICE=cuda bash run_all_datasets.sh
 #   SKIP_PLOTS=true bash run_all_datasets.sh          # skip merge_and_plot step
+#   RUN_DIR=my_run bash run_all_datasets.sh           # override run directory name
 # =============================================================================
 set -euo pipefail
 
 cd "$(dirname "$0")"
+
+# -- timestamped run directory -----------------------------------------------
+# All outputs go under this root so each invocation is self-contained.
+# Override by setting RUN_DIR before calling the script.
+TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+RUN_ROOT="${RUN_DIR:-results_${TIMESTAMP}}"
+mkdir -p "${RUN_ROOT}"
+log_file="${RUN_ROOT}/run.log"
+echo "Run started at $(date)" | tee "${log_file}"
+echo "All outputs will be written to: ${RUN_ROOT}/" | tee -a "${log_file}"
 
 # -- tuneable defaults -------------------------------------------------------
 # NOTE: All MCMC defaults are kept in sync with generate_sequences.py parse_args().
@@ -83,7 +106,7 @@ if [[ "${SKIP_UV_SYNC}" != "true" ]]; then
 fi
 
 # -- helpers -----------------------------------------------------------------
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${log_file}"; }
 
 should_run() {
   local ds="$1"
@@ -124,8 +147,8 @@ for entry in "${DATASET_REGISTRY[@]}"; do
   # ---- BASELINE (PRO-LDM diffusion sampler) --------------------------------
   if mode_requested baseline; then
     log "  -- baseline --"
-    OUT_DIR="baseline/outputs/${DATASET}"
-    RES_DIR="baseline/results/${DATASET}"
+    OUT_DIR="${RUN_ROOT}/baseline/outputs/${DATASET}"
+    RES_DIR="${RUN_ROOT}/baseline/results/${DATASET}"
     mkdir -p "$OUT_DIR" "$RES_DIR"
 
     if [[ ! -f "../PROLDM_OUTLIER/$BASELINE_CKPT" ]]; then
@@ -170,8 +193,8 @@ for entry in "${DATASET_REGISTRY[@]}"; do
     mode_requested "$METHOD" || continue
     log "  -- $METHOD --"
 
-    OUT_DIR="${METHOD}/outputs/${DATASET}"
-    RES_DIR="${METHOD}/results/${DATASET}"
+    OUT_DIR="${RUN_ROOT}/${METHOD}/outputs/${DATASET}"
+    RES_DIR="${RUN_ROOT}/${METHOD}/results/${DATASET}"
     mkdir -p "$OUT_DIR" "$RES_DIR"
 
     # ess uses ESS_DELTA; tess uses TESS_DELTA (same algorithm, different center+delta)
@@ -223,8 +246,8 @@ for entry in "${DATASET_REGISTRY[@]}"; do
   if mode_requested transport_ess; then
     log "  -- transport_ess --"
 
-    OUT_DIR="transport_ess/outputs/${DATASET}"
-    RES_DIR="transport_ess/results/${DATASET}"
+    OUT_DIR="${RUN_ROOT}/transport_ess/outputs/${DATASET}"
+    RES_DIR="${RUN_ROOT}/transport_ess/results/${DATASET}"
     mkdir -p "$OUT_DIR" "$RES_DIR"
 
     log "    generating $N sequences (RealNVP flow, buffer=${FLOW_BUFFER_SIZE}, adapt_every=${FLOW_ADAPT_EVERY})..."
@@ -283,8 +306,8 @@ for entry in "${DATASET_REGISTRY[@]}"; do
   if mode_requested ress; then
     log "  -- ress (rejection ESS) --"
 
-    OUT_DIR="ress/outputs/${DATASET}"
-    RES_DIR="ress/results/${DATASET}"
+    OUT_DIR="${RUN_ROOT}/ress/outputs/${DATASET}"
+    RES_DIR="${RUN_ROOT}/ress/results/${DATASET}"
     mkdir -p "$OUT_DIR" "$RES_DIR"
 
     # Over-sample so the rejection filter still yields N accepted sequences
@@ -343,7 +366,7 @@ done
 # -- final summary table -----------------------------------------------------
 if [[ ${#SUMMARY_FILES[@]} -gt 0 ]]; then
   log "===== SUMMARY TABLE ====="
-  TSV_OUT="results_summary.tsv"
+  TSV_OUT="${RUN_ROOT}/results_summary.tsv"
 
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "dataset" "method" "n_sequences" \
@@ -377,7 +400,7 @@ print(ds, method,
     sep='\t')
 PYEOF
   done | tee -a "$TSV_OUT"
-  log "Summary saved to: $TSV_OUT"
+  log "Summary saved to: ${TSV_OUT}"
 fi
 
 # -- per-dataset merge + plot ------------------------------------------------
@@ -387,11 +410,12 @@ if [[ "${SKIP_PLOTS}" != "true" ]]; then
     IFS=: read -r DATASET TRAIN_CSV AE_CKPT BASELINE_CKPT WT_PDB <<< "$entry"
     should_run "$DATASET" || continue
 
-    BASELINE_RES="baseline/results/${DATASET}/results.csv"
-    ESS_RES="ess/results/${DATASET}/results.csv"
-    TESS_RES="tess/results/${DATASET}/results.csv"
-    TRANSPORT_RES="transport_ess/results/${DATASET}/results.csv"
-    RESS_RES="ress/results/${DATASET}/results.csv"
+    BASELINE_RES="${RUN_ROOT}/baseline/results/${DATASET}/results.csv"
+    ESS_RES="${RUN_ROOT}/ess/results/${DATASET}/results.csv"
+    TESS_RES="${RUN_ROOT}/tess/results/${DATASET}/results.csv"
+    TRANSPORT_RES="${RUN_ROOT}/transport_ess/results/${DATASET}/results.csv"
+    RESS_RES="${RUN_ROOT}/ress/results/${DATASET}/results.csv"
+    PLOTS_DIR="${RUN_ROOT}/common/${DATASET}/results"
 
     # Only call merge_and_plot if at least the baseline results exist
     if [[ ! -f "$BASELINE_RES" ]]; then
@@ -399,10 +423,12 @@ if [[ "${SKIP_PLOTS}" != "true" ]]; then
       continue
     fi
 
+    mkdir -p "${PLOTS_DIR}"
+
     WT_PDB_FLAG=""; [[ "$WT_PDB" != "none" ]] && WT_PDB_FLAG="--wt-pdb ${WT_PDB}"
     STRUCT_FLAG="${WITH_STRUCTURE}"; [[ "$WT_PDB" == "none" ]] && STRUCT_FLAG="false"
 
-    log "  Generating plots for $DATASET..."
+    log "  Generating plots for $DATASET -> ${PLOTS_DIR}/"
     uv run --no-sync python merge_and_plot.py \
       --proldm-root        ../PROLDM_OUTLIER \
       --train-csv          "${TRAIN_CSV}" \
@@ -413,16 +439,16 @@ if [[ "${SKIP_PLOTS}" != "true" ]]; then
       --tess-results       "${TESS_RES}" \
       --transport-results  "${TRANSPORT_RES}" \
       --ress-results       "${RESS_RES}" \
-      --common-dir         "common/${DATASET}" \
-      --results-dir        "common/${DATASET}/results" \
+      --common-dir         "${RUN_ROOT}/common/${DATASET}" \
+      --results-dir        "${PLOTS_DIR}" \
       --with-structure     "${STRUCT_FLAG}" \
       --device             "${DEVICE}" \
       ${WT_PDB_FLAG} || log "  WARNING: merge_and_plot failed for $DATASET (non-fatal)"
 
-    log "  Plots saved to: common/${DATASET}/results/"
+    log "  Plots saved to: ${PLOTS_DIR}/"
   done
 else
   log "SKIP_PLOTS=true -- skipping merge_and_plot step"
 fi
 
-log "All done."
+log "All done. Run directory: ${RUN_ROOT}/"
