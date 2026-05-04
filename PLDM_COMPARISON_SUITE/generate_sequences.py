@@ -48,13 +48,59 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-esm2", type=str2bool, default=False)
     p.add_argument("--n", type=int, default=50)
     p.add_argument("--num-chains", type=int, default=8)
-    p.add_argument("--tess-delta", type=float, default=0.14)
-    p.add_argument("--delta-final", type=float, default=None)
-    p.add_argument("--latent-temperature", type=float, default=0.75)
+    # ------------------------------------------------------------------ #
+    # ESS / TESS core hyperparameters                                      #
+    #                                                                      #
+    # tess-delta (ball radius)                                             #
+    #   Raised from 0.14 → 0.5.  Latent vectors have typical L2 norm      #
+    #   ~sqrt(latent_dim) ≈ 5-6 for dim=32, so 0.14 covered only ~0.6%   #
+    #   of that norm -- the constraint fired on nearly every step and       #
+    #   collapsed the angle bracket in 3-4 iterations, starving chains     #
+    #   of unique proposals.  0.5 gives ~8-9% of the norm: meaningfully   #
+    #   constraining without killing exploration.                           #
+    #                                                                      #
+    # delta-final                                                          #
+    #   Optional linear anneal target for the ball radius.  Setting to    #
+    #   1.0 loosens the ball as the chain warms up (step 0→max_steps maps  #
+    #   delta→delta_final), allowing late-chain exploration.               #
+    #                                                                      #
+    # latent-temperature                                                   #
+    #   Raised from 0.75 → 1.2.  T<1 compresses ν ~ N(0, T²I) toward 0,  #
+    #   keeping proposals close to z_current; T=1 is the exact Gaussian   #
+    #   prior; T=1.2 widens the ellipse so chains can jump across shallow  #
+    #   valleys and reach higher-fitness peaks.  The log-likelihood        #
+    #   threshold in the accept/reject step still enforces correctness     #
+    #   (bracket shrinks until a valid point is found), so higher T only   #
+    #   increases *proposal range*, not raw accept rate.                   #
+    # ------------------------------------------------------------------ #
+    p.add_argument("--tess-delta", type=float, default=0.5,
+                   help="Ball radius constraining proposals around seed latent. "
+                        "Raised from 0.14 to 0.5 -- see comment in parse_args.")
+    p.add_argument("--delta-final", type=float, default=1.0,
+                   help="If set, linearly anneal delta from tess-delta → delta-final "
+                        "over the chain.  1.0 = gradually release the ball constraint.")
+    p.add_argument("--latent-temperature", type=float, default=1.2,
+                   help="ESS temperature T: scales auxiliary ν ~ N(0, T²I). "
+                        "Raised from 0.75 to 1.2 to widen ellipse and improve mixing.")
     p.add_argument("--use-transport", type=str2bool, default=False)
     p.add_argument("--transport-strength", type=float, default=0.5)
-    p.add_argument("--burnin", type=int, default=20)
-    p.add_argument("--max-steps", type=int, default=5000)
+    # ------------------------------------------------------------------ #
+    # Burn-in / steps                                                      #
+    #                                                                      #
+    # burnin: 20 → 100                                                     #
+    #   Short burnin meant samples were collected before the EMA           #
+    #   normaliser had accumulated enough statistics, biasing early        #
+    #   score estimates.  100 steps gives the RunningNorm ~5 half-lives    #
+    #   at the default ema_alpha=0.05.                                     #
+    #                                                                      #
+    # max-steps: 5000 → 10000                                              #
+    #   More steps directly increases unique-sequence yield before the     #
+    #   bracket collapses or the per-chain quota is met.                   #
+    # ------------------------------------------------------------------ #
+    p.add_argument("--burnin", type=int, default=100,
+                   help="Steps to discard before collecting samples. Raised 20 → 100.")
+    p.add_argument("--max-steps", type=int, default=10000,
+                   help="Max MCMC steps per chain. Raised 5000 → 10000.")
     p.add_argument("--mode", type=str, choices=["baseline", "ess", "tess", "transport_ess", "all"], default="all")
     p.add_argument("--omega", type=float, default=20.0)
     p.add_argument("--esm-weight", type=float, default=0.5)
