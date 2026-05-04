@@ -2,6 +2,7 @@ import argparse
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +22,7 @@ from pipeline_utils import (
     normalize_ckpt_state,
     seq_to_inds,
 )
+from sampler_ess import RunningNorm, TransportESSSampler, ess_step
 
 
 def str2bool(v: str) -> bool:
@@ -63,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", type=str, default="outputs")
+    # TESS flow hyperparameters
+    p.add_argument("--flow-buffer-size", type=int, default=128)
+    p.add_argument("--flow-adapt-every", type=int, default=32)
+    p.add_argument("--flow-lr", type=float, default=1e-3)
+    p.add_argument("--flow-adapt-steps", type=int, default=5)
     return p.parse_args()
 
 
@@ -113,7 +120,25 @@ def diffusion_baseline(
 
 
 class Likelihood:
-    def __init__(self, ae: torch.nn.Module, esm2: ESM2Scorer, seq_len: int, device: torch.device, esm_w: float, reg_w: float, alpha: float):
+    """
+    Combined fitness log-likelihood for ESS/TESS.
+
+    Uses RunningNorm (EMA) to normalise each score stream so single-sample
+    evaluation (batch size = 1, common in MCMC steps) is numerically stable
+    -- avoids the std=0 divide-by-zero present in the previous batch-norm impl.
+    """
+
+    def __init__(
+        self,
+        ae: torch.nn.Module,
+        esm2: ESM2Scorer,
+        seq_len: int,
+        device: torch.device,
+        esm_w: float,
+        reg_w: float,
+        alpha: float,
+        ema_alpha: float = 0.05,
+    ):
         self.ae = ae
         self.esm2 = esm2
         self.seq_len = seq_len
@@ -121,6 +146,9 @@ class Likelihood:
         self.esm_w = esm_w
         self.reg_w = reg_w
         self.alpha = alpha
+
+        self._norm_reg = RunningNorm(alpha=ema_alpha)
+        self._norm_esm = RunningNorm(alpha=ema_alpha)
 
     @torch.no_grad()
     def decode_seq(self, z: torch.Tensor) -> List[str]:
@@ -130,16 +158,25 @@ class Likelihood:
 
     @torch.no_grad()
     def __call__(self, z: torch.Tensor) -> torch.Tensor:
-        reg = self.ae.regressor_module(z).squeeze(-1)
+        # z may be (D,) or (1, D); normalise to (1, D) for regressor
+        z_ = z if z.dim() == 2 else z.unsqueeze(0)
+        reg = self.ae.regressor_module(z_).squeeze(-1)  # (B,) or scalar
+
+        # Reduce to scalar for single-sample MCMC steps
+        reg_scalar = reg.squeeze()
+        reg_n = self._norm_reg.update_and_normalize(reg_scalar)
+
         if self.esm2 is None:
-            return reg
-        seqs = self.decode_seq(z)
+            return reg_n
+
+        seqs = self.decode_seq(z_)
         esm, _ = self.esm2.score_and_perplexity(seqs)
-        reg_z = (reg - reg.mean()) / reg.std(unbiased=False).clamp_min(1e-8)
-        esm_z = (esm - esm.mean()) / esm.std(unbiased=False).clamp_min(1e-8)
+        esm_scalar = esm.squeeze()
+        esm_n = self._norm_esm.update_and_normalize(esm_scalar)
+
         if self.alpha is not None:
-            return self.alpha * esm_z + (1.0 - self.alpha) * reg_z
-        return self.esm_w * esm_z + self.reg_w * reg_z
+            return self.alpha * esm_n + (1.0 - self.alpha) * reg_n
+        return self.esm_w * esm_n + self.reg_w * reg_n
 
 
 def infer_checkpoint_model_type(ckpt_path: Path) -> str:
@@ -179,7 +216,6 @@ def build_chain_starts(
     if len(ranked) == 0:
         ranked = train_df.copy()
 
-    # Prefer distinct sequences so each chain starts from a different natural protein.
     ranked = ranked.drop_duplicates(subset=[seq_col], keep="first")
     seeds: List[torch.Tensor] = []
     for _, row in ranked.head(max(num_chains, 8)).iterrows():
@@ -196,7 +232,7 @@ def build_chain_starts(
 
 
 @torch.no_grad()
-def ess_step(
+def _ess_step_with_delta(
     z_current: torch.Tensor,
     ll_current: torch.Tensor,
     ll_fn,
@@ -205,6 +241,10 @@ def ess_step(
     temperature: float,
     max_attempts: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    ESS step with optional ball constraint (delta) around center.
+    Wraps sampler_ess.ess_step for use inside sample_ess_tess.
+    """
     nu = temperature * torch.randn_like(z_current)
     log_y = ll_current + torch.log(torch.rand(1, device=z_current.device))
 
@@ -222,60 +262,9 @@ def ess_step(
                     theta_max = theta
                 theta = torch.empty(1, device=z_current.device).uniform_(theta_min.item(), theta_max.item())
                 continue
-
         ll_prop = ll_fn(prop.unsqueeze(0)).squeeze(0)
         if ll_prop > log_y:
             return prop, ll_prop, attempts
-
-        if theta.item() < 0:
-            theta_min = theta
-        else:
-            theta_max = theta
-        theta = torch.empty(1, device=z_current.device).uniform_(theta_min.item(), theta_max.item())
-
-    return z_current, ll_current, max_attempts
-
-
-@torch.no_grad()
-def transport_ess_step(
-    z_current: torch.Tensor,
-    ll_current: torch.Tensor,
-    ll_fn,
-    center: Optional[torch.Tensor],
-    delta: Optional[float],
-    temperature: float,
-    transport_strength: float,
-    max_attempts: int = 256,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    base = center if center is not None else torch.zeros_like(z_current)
-    scale = 1.0 + float(transport_strength) * torch.abs(z_current - base)
-    scale = torch.clamp(scale, min=1e-4)
-
-    u_current = (z_current - base) / scale
-    nu = temperature * torch.randn_like(u_current)
-    log_y = ll_current + torch.log(torch.rand(1, device=z_current.device))
-
-    theta = torch.rand(1, device=z_current.device) * (2.0 * math.pi)
-    theta_min = theta - 2.0 * math.pi
-    theta_max = theta.clone()
-
-    for attempts in range(1, max_attempts + 1):
-        u_prop = u_current * torch.cos(theta) + nu * torch.sin(theta)
-        prop = base + scale * u_prop
-
-        if center is not None and delta is not None:
-            if torch.norm(prop - center, p=2).item() > float(delta):
-                if theta.item() < 0:
-                    theta_min = theta
-                else:
-                    theta_max = theta
-                theta = torch.empty(1, device=z_current.device).uniform_(theta_min.item(), theta_max.item())
-                continue
-
-        ll_prop = ll_fn(prop.unsqueeze(0)).squeeze(0)
-        if ll_prop > log_y:
-            return prop, ll_prop, attempts
-
         if theta.item() < 0:
             theta_min = theta
         else:
@@ -300,53 +289,76 @@ def sample_ess_tess(
     temperature: float,
     use_transport: bool,
     transport_strength: float,
+    latent_dim: int = 32,
+    flow_buffer_size: int = 128,
+    flow_adapt_every: int = 32,
+    flow_lr: float = 1e-3,
+    flow_adapt_steps: int = 5,
+    device: Optional[torch.device] = None,
 ) -> pd.DataFrame:
     rows = []
     duplicate_rows = []
     per_chain = math.ceil(n / num_chains)
     seen_sequences = set()
 
+    t_start = time.perf_counter()
+
     for chain in range(num_chains):
         z = z_starts[chain % len(z_starts)].clone()
         ll = ll_fn(z.unsqueeze(0)).squeeze(0)
         saved = 0
+
+        # Build a per-chain TransportESSSampler when use_transport is True
+        if use_transport:
+            tess_sampler = TransportESSSampler(
+                z_init=z,
+                log_likelihood_fn=ll_fn,
+                latent_dim=latent_dim,
+                temperature=temperature,
+                buffer_size=flow_buffer_size,
+                adapt_every=flow_adapt_every,
+                flow_lr=flow_lr,
+                n_adapt_steps=flow_adapt_steps,
+                device=device or z.device,
+            )
+
         for step in range(max_steps):
             if delta is not None and delta_final is not None and max_steps > 1:
                 frac = float(step) / float(max_steps - 1)
                 delta_now = (1.0 - frac) * float(delta) + frac * float(delta_final)
             else:
                 delta_now = delta
+
             if use_transport:
-                z, ll, attempts = transport_ess_step(
-                    z,
-                    ll,
-                    ll_fn,
-                    center,
-                    delta_now,
-                    temperature,
-                    transport_strength,
-                )
+                z, accepted = tess_sampler.step()
+                ll = ll_fn(z.unsqueeze(0)).squeeze(0)
             else:
-                z, ll, attempts = ess_step(z, ll, ll_fn, center, delta_now, temperature)
+                z, ll, _ = _ess_step_with_delta(
+                    z, ll, ll_fn, center, delta_now, temperature
+                )
+
             if step < burnin:
                 continue
+
             seq = clean_seq(inds_to_seq(torch.argmax(ae.decode(z.unsqueeze(0)), dim=1).squeeze(0)))
             if seq in seen_sequences:
-                duplicate_rows.append({"chain": chain, "step": step, "attempts": attempts, "sequence": seq, "score": float(ll.item())})
+                duplicate_rows.append({"chain": chain, "step": step, "sequence": seq, "score": float(ll.item())})
                 continue
             seen_sequences.add(seq)
-            rows.append({"chain": chain, "step": step, "attempts": attempts, "sequence": seq, "score": float(ll.item())})
+            rows.append({"chain": chain, "step": step, "sequence": seq, "score": float(ll.item())})
             saved += 1
             if saved >= per_chain:
                 break
 
+    runtime_sec = time.perf_counter() - t_start
+
     if len(rows) < n and duplicate_rows:
         need = n - len(rows)
-        # Prefer stronger-scoring fallback samples if we need to pad to requested n.
         duplicate_rows = sorted(duplicate_rows, key=lambda r: r["score"], reverse=True)
         rows.extend(duplicate_rows[:need])
 
     out = pd.DataFrame(rows).head(n).reset_index(drop=True)
+    out["runtime_sec"] = runtime_sec  # written for ESS/sec computation in evaluate_method
     if len(out) < n:
         print(
             f"[warn] sampler returned {len(out)} < requested {n} (insufficient accepted states under current constraints)"
@@ -420,11 +432,13 @@ def main() -> None:
     else:
         print("[likelihood] regressor-only score (ESM2 disabled)")
     if args.use_transport:
-        print(f"[sampler] transport ESS enabled (strength={args.transport_strength:.3f})")
+        print(f"[sampler] transport ESS with learned RealNVP flow (buffer={args.flow_buffer_size}, adapt_every={args.flow_adapt_every})")
     else:
-        print("[sampler] standard ESS/TESS")
+        print("[sampler] standard ESS")
 
+    latent_dim = dims.get("latent_dim", 32)
     modes = [args.mode] if args.mode != "all" else ["baseline", "ess", "tess", "transport_ess"]
+
     if "baseline" in modes:
         validate_model_type(args.baseline_model_type, baseline_ckpt, label="Baseline diffusion")
         baseline_seqs = diffusion_baseline(
@@ -440,55 +454,33 @@ def main() -> None:
 
     if "ess" in modes:
         ess_df = sample_ess_tess(
-            ae=ae,
-            ll_fn=ll,
-            z_starts=z_start_pool,
-            n=args.n,
-            num_chains=args.num_chains,
-            burnin=args.burnin,
-            max_steps=args.max_steps,
-            center=z_start,
-            delta=args.tess_delta,
-            delta_final=args.delta_final,
-            temperature=args.latent_temperature,
-            use_transport=args.use_transport,
-            transport_strength=args.transport_strength,
+            ae=ae, ll_fn=ll, z_starts=z_start_pool, n=args.n, num_chains=args.num_chains,
+            burnin=args.burnin, max_steps=args.max_steps,
+            center=z_start, delta=args.tess_delta, delta_final=args.delta_final,
+            temperature=args.latent_temperature, use_transport=False,
+            transport_strength=args.transport_strength, latent_dim=latent_dim, device=device,
         )
         ess_df.to_csv(out_dir / "results_ess.csv", index=False)
 
     if "tess" in modes:
         tess_df = sample_ess_tess(
-            ae=ae,
-            ll_fn=ll,
-            z_starts=z_start_pool,
-            n=args.n,
-            num_chains=args.num_chains,
-            burnin=args.burnin,
-            max_steps=args.max_steps,
-            center=z_wt,
-            delta=args.tess_delta,
-            delta_final=args.delta_final,
-            temperature=args.latent_temperature,
-            use_transport=args.use_transport,
-            transport_strength=args.transport_strength,
+            ae=ae, ll_fn=ll, z_starts=z_start_pool, n=args.n, num_chains=args.num_chains,
+            burnin=args.burnin, max_steps=args.max_steps,
+            center=z_wt, delta=args.tess_delta, delta_final=args.delta_final,
+            temperature=args.latent_temperature, use_transport=False,
+            transport_strength=args.transport_strength, latent_dim=latent_dim, device=device,
         )
         tess_df.to_csv(out_dir / "results_tess.csv", index=False)
 
     if "transport_ess" in modes:
         transport_df = sample_ess_tess(
-            ae=ae,
-            ll_fn=ll,
-            z_starts=z_start_pool,
-            n=args.n,
-            num_chains=args.num_chains,
-            burnin=args.burnin,
-            max_steps=args.max_steps,
-            center=z_wt,
-            delta=args.tess_delta,
-            delta_final=args.delta_final,
-            temperature=args.latent_temperature,
-            use_transport=True,
-            transport_strength=args.transport_strength,
+            ae=ae, ll_fn=ll, z_starts=z_start_pool, n=args.n, num_chains=args.num_chains,
+            burnin=args.burnin, max_steps=args.max_steps,
+            center=z_wt, delta=args.tess_delta, delta_final=args.delta_final,
+            temperature=args.latent_temperature, use_transport=True,
+            transport_strength=args.transport_strength, latent_dim=latent_dim,
+            flow_buffer_size=args.flow_buffer_size, flow_adapt_every=args.flow_adapt_every,
+            flow_lr=args.flow_lr, flow_adapt_steps=args.flow_adapt_steps, device=device,
         )
         transport_df.to_csv(out_dir / "results_transport_ess.csv", index=False)
 

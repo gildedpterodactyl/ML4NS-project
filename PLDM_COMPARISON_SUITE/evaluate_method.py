@@ -1,9 +1,10 @@
 import argparse
 import json
+import math
 import sys
 import urllib.request
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,15 @@ from pipeline_utils import (
     seq_hash,
     seq_to_inds,
 )
+
+
+# ---------------------------------------------------------------------------
+# Amino-acid alphabet
+# ---------------------------------------------------------------------------
+
+_AA_ALPHABET = list("ACDEFGHIKLMNPQRSTVWY")  # 20 canonical, alphabetical
+_AA_TO_IDX = {a: i for i, a in enumerate(_AA_ALPHABET)}
+_GAP_IDX = len(_AA_ALPHABET)  # index for unknown / gap
 
 
 def str2bool(v: str) -> bool:
@@ -57,19 +67,195 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--structure-max-per-method", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
+    # runtime_sec is written by generate_sequences.py into the input CSV;
+    # if absent the user can supply it here for ESS/sec computation.
+    p.add_argument("--runtime-sec", type=float, default=None)
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Encoding helper
+# ---------------------------------------------------------------------------
 
 def encode(model, seqs: List[str], seq_len: int, device: torch.device, batch_size: int) -> torch.Tensor:
     out = []
     with torch.no_grad():
         for i in range(0, len(seqs), batch_size):
-            chunk = seqs[i : i + batch_size]
+            chunk = seqs[i: i + batch_size]
             inds = torch.stack([seq_to_inds(s, seq_len) for s in chunk], dim=0).to(device)
             z = model.encode(inds).to(torch.float32)
             out.append(z.cpu())
     return torch.cat(out, dim=0)
 
+
+# ---------------------------------------------------------------------------
+# Novelty metrics
+# ---------------------------------------------------------------------------
+
+def min_train_distance_metrics(
+    seq: str,
+    train_seqs: List[str],
+) -> Tuple[float, int, str]:
+    """Return (best_identity, min_hamming, nearest_train_seq)."""
+    best_id = -1.0
+    best_h = int(1e9)
+    best_match = ""
+    for t in train_seqs:
+        id_ = identity(seq, t)
+        h = hamming(seq, t)
+        if id_ > best_id:
+            best_id = id_
+            best_h = h
+            best_match = t
+    return float(best_id), int(best_h), best_match
+
+
+# ---------------------------------------------------------------------------
+# Per-position amino-acid distribution helpers
+# ---------------------------------------------------------------------------
+
+def _encode_positions(seqs: List[str]) -> np.ndarray:
+    """Return (N, L) integer array; unknown residues mapped to _GAP_IDX."""
+    L = max(len(s) for s in seqs) if seqs else 1
+    arr = np.full((len(seqs), L), _GAP_IDX, dtype=np.int32)
+    for i, s in enumerate(seqs):
+        for j, ch in enumerate(s[:L]):
+            arr[i, j] = _AA_TO_IDX.get(ch, _GAP_IDX)
+    return arr
+
+
+def positional_entropy(seqs: List[str]) -> np.ndarray:
+    """Shannon entropy at each position (nats), ignoring gap/unknown."""
+    arr = _encode_positions(seqs)
+    N, L = arr.shape
+    H = np.zeros(L, dtype=np.float64)
+    for j in range(L):
+        col = arr[:, j]
+        valid = col[col < _GAP_IDX]
+        if len(valid) == 0:
+            H[j] = 0.0
+            continue
+        counts = np.bincount(valid, minlength=len(_AA_ALPHABET)).astype(np.float64)
+        p = counts / counts.sum()
+        nz = p > 0
+        H[j] = -(p[nz] * np.log(p[nz])).sum()
+    return H
+
+
+def entropy_mse(train_seqs: List[str], gen_seqs: List[str]) -> float:
+    """
+    Mean-squared difference in per-position Shannon entropy between the
+    training set and the generated set.  Lower = generated set has a
+    similar positional diversity profile to training.
+    """
+    if not train_seqs or not gen_seqs:
+        return float("nan")
+    Ht = positional_entropy(train_seqs)
+    Hg = positional_entropy(gen_seqs)
+    L = max(len(Ht), len(Hg))
+    Ht = np.pad(Ht, (0, L - len(Ht)))
+    Hg = np.pad(Hg, (0, L - len(Hg)))
+    return float(np.mean((Ht - Hg) ** 2))
+
+
+def pairwise_residue_correlation(train_seqs: List[str], gen_seqs: List[str]) -> float:
+    """
+    Pearson correlation between the upper-triangle of the pairwise
+    same-residue co-occurrence matrices of training and generated sets.
+    +1.0 = identical pairwise residue structure.
+    """
+    if not train_seqs or not gen_seqs:
+        return float("nan")
+
+    At = _encode_positions(train_seqs)
+    Ag = _encode_positions(gen_seqs)
+    L = max(At.shape[1], Ag.shape[1])
+
+    def _pad(X):
+        if X.shape[1] < L:
+            X = np.hstack([X, np.full((X.shape[0], L - X.shape[1]), _GAP_IDX, dtype=np.int32)])
+        return X
+
+    At = _pad(At)
+    Ag = _pad(Ag)
+
+    def _cooc_upper(X):
+        vals = []
+        for i in range(L):
+            for j in range(i + 1, min(L, i + 51)):
+                f_t = np.mean(X[:, i] == X[:, j])
+                vals.append(f_t)
+        return np.array(vals, dtype=np.float64)
+
+    vt = _cooc_upper(At)
+    vg = _cooc_upper(Ag)
+    if vt.std() < 1e-12 or vg.std() < 1e-12:
+        return 0.0
+    return float(np.corrcoef(vt, vg)[0, 1])
+
+
+# ---------------------------------------------------------------------------
+# Chain mixing / MCMC diagnostics
+# ---------------------------------------------------------------------------
+
+def iact_1d(x: np.ndarray) -> float:
+    """Integrated autocorrelation time using the initial monotone sequence estimator."""
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) < 4:
+        return 1.0
+    x = x - x.mean()
+    var = np.var(x)
+    if var < 1e-14:
+        return 1.0
+    acf = np.correlate(x, x, mode="full")[len(x) - 1:]
+    acf = acf / acf[0]
+    tau = 1.0
+    for k in range(1, len(acf)):
+        if acf[k] <= 0:
+            break
+        tau += 2.0 * acf[k]
+    return float(max(tau, 1.0))
+
+
+def chain_mixing_metrics(df: pd.DataFrame, runtime_sec: Optional[float]) -> Dict[str, float]:
+    """
+    Compute worst-chain IACT, minimum ESS, and ESS/sec.
+
+    Reads 'chain' and 'score' columns; falls back to single-chain if absent.
+    'runtime_sec' may come from the input CSV (column) or CLI flag.
+    """
+    if "score" not in df.columns:
+        return {"iact": float("nan"), "ess": float("nan"), "ess_per_sec": float("nan")}
+
+    if runtime_sec is None and "runtime_sec" in df.columns:
+        runtime_sec = float(df["runtime_sec"].iloc[0])
+    if runtime_sec is None or runtime_sec <= 0:
+        runtime_sec = 1.0
+
+    if "chain" in df.columns:
+        groups = [g for _, g in df.groupby("chain")]
+    else:
+        groups = [df]
+
+    taus, esss = [], []
+    for g in groups:
+        x = g.sort_values("step")["score"].to_numpy(dtype=np.float64) if "step" in g.columns else g["score"].to_numpy(dtype=np.float64)
+        tau = iact_1d(x)
+        taus.append(tau)
+        esss.append(len(x) / tau)
+
+    iact = float(np.max(taus))
+    ess  = float(np.min(esss))
+    return {
+        "iact": iact,
+        "ess": ess,
+        "ess_per_sec": ess / runtime_sec,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Structure helpers
+# ---------------------------------------------------------------------------
 
 def ensure_pdb(wt_pdb: str, results_dir: Path) -> Path:
     local = Path(wt_pdb)
@@ -81,18 +267,18 @@ def ensure_pdb(wt_pdb: str, results_dir: Path) -> Path:
     return out
 
 
-def add_structure_metrics(df: pd.DataFrame, device: torch.device, wt_coords: np.ndarray, max_n: int) -> pd.DataFrame:
+def add_structure_metrics(
+    df: pd.DataFrame,
+    device: torch.device,
+    wt_coords: np.ndarray,
+    max_n: int,
+) -> pd.DataFrame:
     try:
         import esm
         from tmtools import tm_align
-        model = esm.pretrained.esmfold_v1().eval().to(device)
-        model.set_chunk_size(128)
-    except ModuleNotFoundError:
-        df["plddt_score"] = np.nan
-        df["tm_score"] = np.nan
-        df["rmsd"] = np.nan
-        return df
-    except Exception:
+        fold_model = esm.pretrained.esmfold_v1().eval().to(device)
+        fold_model.set_chunk_size(128)
+    except (ModuleNotFoundError, Exception):
         df["plddt_score"] = np.nan
         df["tm_score"] = np.nan
         df["rmsd"] = np.nan
@@ -103,12 +289,14 @@ def add_structure_metrics(df: pd.DataFrame, device: torch.device, wt_coords: np.
     df["tm_score"] = np.nan
     df["rmsd"] = np.nan
 
-    order = df.sort_values("esm2_fitness", ascending=False).head(max_n).index
+    score_col = "esm2_fitness" if "esm2_fitness" in df.columns else "pldm_regressor_score"
+    order = df.sort_values(score_col, ascending=False).head(max_n).index
+
     with torch.no_grad():
         for idx in order:
             seq = str(df.loc[idx, "sequence"])
             try:
-                pdb_txt = model.infer_pdb(seq)
+                pdb_txt = fold_model.infer_pdb(seq)
                 plddt = pdb_mean_plddt(pdb_txt)
                 tmp = Path("/tmp") / f"cmp_{idx}.pdb"
                 tmp.write_text(pdb_txt)
@@ -119,12 +307,12 @@ def add_structure_metrics(df: pd.DataFrame, device: torch.device, wt_coords: np.
                     tm_score = float(align.tm_norm_chain1)
                     rmsd = kabsch_rmsd(pred_coords[:n], wt_coords[:n])
                 else:
-                    tm_score = np.nan
-                    rmsd = np.nan
+                    tm_score = float("nan")
+                    rmsd = float("nan")
             except Exception:
-                plddt = np.nan
-                tm_score = np.nan
-                rmsd = np.nan
+                plddt = float("nan")
+                tm_score = float("nan")
+                rmsd = float("nan")
             df.loc[idx, "plddt_score"] = plddt
             df.loc[idx, "tm_score"] = tm_score
             df.loc[idx, "rmsd"] = rmsd
@@ -132,89 +320,142 @@ def add_structure_metrics(df: pd.DataFrame, device: torch.device, wt_coords: np.
     return df
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    script_dir = Path(__file__).resolve().parent
-    proldm_root = (script_dir / args.proldm_root).resolve()
-    train_csv = (proldm_root / args.train_csv).resolve()
-    ae_ckpt = (proldm_root / args.ae_ckpt).resolve()
-    input_csv = (script_dir / args.input_csv).resolve()
-    results_csv = (script_dir / args.results_csv).resolve()
+    script_dir    = Path(__file__).resolve().parent
+    proldm_root   = (script_dir / args.proldm_root).resolve()
+    train_csv     = (proldm_root / args.train_csv).resolve()
+    ae_ckpt       = (proldm_root / args.ae_ckpt).resolve()
+    input_csv     = (script_dir / args.input_csv).resolve()
+    results_csv   = (script_dir / args.results_csv).resolve()
     results_csv.parent.mkdir(parents=True, exist_ok=True)
 
     for p in [train_csv, ae_ckpt, input_csv]:
         if not p.exists():
             raise FileNotFoundError(p)
 
-    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
-    train_df = pd.read_csv(train_csv)
-    wt_seq = choose_wt(train_df)
+    device    = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+    train_df  = pd.read_csv(train_csv)
+    wt_seq    = choose_wt(train_df)
+    train_seq_col = infer_seq_col(train_df)
+    train_seqs = [clean_seq(str(s)) for s in train_df[train_seq_col].dropna().tolist()]
 
     sys.path.insert(0, str(proldm_root))
     from model.JTAE.models_condif_1d import jtae
 
     ckpt_raw = torch.load(ae_ckpt, map_location=device)
-    state = normalize_ckpt_state(ckpt_raw)
-    dims = infer_dims_from_state(state)
-    hparams = build_hparams(args.dataset, dims, device)
-    model = jtae(hparams).to(device)
+    state    = normalize_ckpt_state(ckpt_raw)
+    dims     = infer_dims_from_state(state)
+    hparams  = build_hparams(args.dataset, dims, device)
+    model    = jtae(hparams).to(device)
     model.load_state_dict(filter_by_shape(state, model.state_dict()), strict=False)
     model.eval()
 
-    raw = pd.read_csv(input_csv)
+    raw     = pd.read_csv(input_csv)
     seq_col = infer_seq_col(raw)
-    seqs = [clean_seq(str(s)) for s in raw[seq_col].tolist()]
+    seqs    = [clean_seq(str(s)) for s in raw[seq_col].tolist()]
 
+    # 1. Internal regressor score (batched)
     z = encode(model, seqs, dims["seq_len"], device, args.batch_size).to(device)
     with torch.no_grad():
-        pldm = model.regressor_module(z).squeeze(-1).detach().cpu().numpy()
+        pldm_score = model.regressor_module(z).squeeze(-1).detach().cpu().numpy()
 
+    # 2. External fitness score via ESM2 (optional)
     esm2 = ESM2Scorer(args.esm2_model, device, args.esm2_head_path) if args.use_esm2 else None
     if esm2 is not None:
-        esm_scores = []
-        perplexities = []
+        esm_scores, perplexities = [], []
         with torch.no_grad():
             for i in range(0, len(seqs), args.batch_size):
-                chunk = seqs[i : i + args.batch_size]
+                chunk = seqs[i: i + args.batch_size]
                 s, p = esm2.score_and_perplexity(chunk)
                 esm_scores.extend(s.detach().cpu().tolist())
                 perplexities.extend(p.detach().cpu().tolist())
     else:
-        esm_scores = [np.nan] * len(seqs)
-        perplexities = [np.nan] * len(seqs)
+        esm_scores    = [float("nan")] * len(seqs)
+        perplexities  = [float("nan")] * len(seqs)
 
-    out = pd.DataFrame(
-        {
-            "sequence": seqs,
-            "id": [seq_hash(s) for s in seqs],
-            "method_name": args.method_name,
-            "sequence_identity_wt": [identity(s, wt_seq) for s in seqs],
-            "hamming_dist_wt": [hamming(s, wt_seq) for s in seqs],
-            "esm2_fitness": esm_scores,
-            "pldm_regressor_score": pldm,
-            "perplexity": perplexities,
-        }
-    )
+    # 3. Per-sequence novelty
+    nearest_id, min_ham, nearest_hash = [], [], []
+    for seq in seqs:
+        bid, bh, bm = min_train_distance_metrics(seq, train_seqs)
+        nearest_id.append(bid)
+        min_ham.append(bh)
+        nearest_hash.append(seq_hash(bm))
 
+    out = pd.DataFrame({
+        "sequence":               seqs,
+        "id":                     [seq_hash(s) for s in seqs],
+        "method_name":            args.method_name,
+        "pldm_regressor_score":   pldm_score,
+        "esm2_fitness":           esm_scores,
+        "perplexity":             perplexities,
+        "sequence_identity_wt":   [identity(s, wt_seq) for s in seqs],
+        "hamming_dist_wt":        [hamming(s, wt_seq)  for s in seqs],
+        "nearest_train_identity": nearest_id,
+        "min_hamming_to_train":   min_ham,
+        "nearest_train_hash":     nearest_hash,
+    })
+
+    # 4. Structure metrics (requires ESMFold + tmtools; skipped if absent)
     if args.with_structure:
         try:
-            wt_pdb = ensure_pdb(args.wt_pdb, results_csv.parent)
+            wt_pdb    = ensure_pdb(args.wt_pdb, results_csv.parent)
             wt_coords = parse_ca_coords_from_pdb(wt_pdb)
             out = add_structure_metrics(out, device, wt_coords, args.structure_max_per_method)
         except ModuleNotFoundError:
-            out["plddt_score"] = np.nan
-            out["tm_score"] = np.nan
-            out["rmsd"] = np.nan
+            out["plddt_score"] = float("nan")
+            out["tm_score"]    = float("nan")
+            out["rmsd"]        = float("nan")
     else:
-        out["plddt_score"] = np.nan
-        out["tm_score"] = np.nan
-        out["rmsd"] = np.nan
+        out["plddt_score"] = float("nan")
+        out["tm_score"]    = float("nan")
+        out["rmsd"]        = float("nan")
 
     out.to_csv(results_csv, index=False)
-    print(f"Saved standardized results to: {results_csv}")
+    print(f"Saved per-sequence results to: {results_csv}")
+
+    # 5. Set-level summary
+    summary: Dict = {
+        "method_name":                           args.method_name,
+        "n_sequences":                           len(seqs),
+        "mean_internal_regressor_score":         float(np.nanmean(pldm_score)),
+        "mean_external_fitness_score":           float(np.nanmean(esm_scores)),
+        "mean_nearest_train_identity":           float(np.nanmean(nearest_id)),
+        "mean_min_hamming_to_train":             float(np.nanmean(min_ham)),
+        "mean_identity_wt":                      float(np.nanmean(out["sequence_identity_wt"])),
+        "entropy_mse_vs_train":                  entropy_mse(train_seqs, seqs),
+        "pairwise_residue_correlation_vs_train": pairwise_residue_correlation(train_seqs, seqs),
+        "mean_plddt_score":                      float(np.nanmean(out["plddt_score"])),
+        "mean_rmsd":                             float(np.nanmean(out["rmsd"])),
+    }
+
+    mix = chain_mixing_metrics(raw, runtime_sec=args.runtime_sec)
+    summary.update(mix)
+
+    summary_path = results_csv.with_suffix(".summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Saved set-level summary to:   {summary_path}")
+
+    print("\n=== Scorecard: {} ===".format(args.method_name))
+    print(f"  Internal regressor score  : {summary['mean_internal_regressor_score']:.4f}")
+    print(f"  External fitness (ESM2)   : {summary['mean_external_fitness_score']:.4f}")
+    print(f"  Nearest-train identity    : {summary['mean_nearest_train_identity']:.4f}")
+    print(f"  Min Hamming to train      : {summary['mean_min_hamming_to_train']:.1f}")
+    print(f"  Entropy MSE vs train      : {summary['entropy_mse_vs_train']:.6f}")
+    print(f"  Pairwise residue corr     : {summary['pairwise_residue_correlation_vs_train']:.4f}")
+    print(f"  Mean pLDDT                : {summary['mean_plddt_score']:.2f}")
+    print(f"  Mean RMSD                 : {summary['mean_rmsd']:.2f}")
+    print(f"  Worst-chain IACT          : {summary['iact']:.2f}")
+    print(f"  Min-chain ESS             : {summary['ess']:.2f}")
+    print(f"  ESS / sec                 : {summary['ess_per_sec']:.4f}")
 
 
 if __name__ == "__main__":
