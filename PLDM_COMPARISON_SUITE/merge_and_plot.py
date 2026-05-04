@@ -32,6 +32,7 @@ METHOD_STYLES = {
     "ess": ("ESS", "tab:blue"),
     "tess": ("TESS", "tab:red"),
     "transport_ess": ("Transport ESS", "tab:purple"),
+    "ress": ("RESS", "tab:green"),
 }
 
 
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ess-results", type=str, default="ess/results/results.csv")
     p.add_argument("--tess-results", type=str, default="tess/results/results.csv")
     p.add_argument("--transport-results", type=str, default="transport/results/results.csv")
+    p.add_argument("--ress-results", type=str, default="ress/results/results.csv")
     p.add_argument("--common-dir", type=str, default="common")
     p.add_argument("--results-dir", type=str, default="common/results")
     p.add_argument("--esm2-model", type=str, default="facebook/esm2_t6_8M_UR50D")
@@ -118,7 +120,12 @@ def ensure_pdb(wt_pdb: str, results_dir: Path) -> Path:
     return out
 
 
-def load_method_csv(path: Path) -> pd.DataFrame:
+def load_method_csv(path: Path, optional: bool = False) -> Optional[pd.DataFrame]:
+    """Load a results CSV.  Returns None (rather than raising) when optional=True and missing."""
+    if not path.exists():
+        if optional:
+            return None
+        raise FileNotFoundError(path)
     df = pd.read_csv(path)
     if "method_name" not in df.columns:
         raise ValueError(f"Missing method_name in {path}")
@@ -400,6 +407,9 @@ def main() -> None:
     ess_csv = (script_dir / args.ess_results).resolve()
     tess_csv = (script_dir / args.tess_results).resolve()
     transport_csv = (script_dir / args.transport_results).resolve()
+    ress_csv = (script_dir / args.ress_results).resolve()
+
+    # All mandatory CSVs except ress (which may not exist if mode was skipped)
     for p in [train_csv, test_csv, ae_ckpt, baseline_csv, ess_csv, tess_csv, transport_csv]:
         if not p.exists():
             raise FileNotFoundError(p)
@@ -428,6 +438,7 @@ def main() -> None:
     ess = load_method_csv(ess_csv)
     tess = load_method_csv(tess_csv)
     transport = load_method_csv(transport_csv)
+    ress = load_method_csv(ress_csv, optional=True)  # may be None if ress mode was skipped
 
     method_frames: Dict[str, pd.DataFrame] = {
         "baseline_pldm": baseline,
@@ -435,6 +446,9 @@ def main() -> None:
         "tess": tess,
         "transport_ess": transport,
     }
+    if ress is not None:
+        method_frames["ress"] = ress
+
     combined = pd.concat(list(method_frames.values()), ignore_index=True)
     combined.to_csv(results_dir / "combined_results.csv", index=False)
 
@@ -461,59 +475,74 @@ def main() -> None:
         except Exception:
             wt_plddt = float("nan")
 
-    table = pd.DataFrame(
-        [
-            {
-                "Method": "Natural (WT)",
-                "Target Label": "N/A",
-                "ESM-2 Score": wt_score_val,
-                "PRO-LDM Score": wt_reg,
-                "Avg. pLDDT": wt_plddt,
-                "Mean Identity": 1.0,
-                "Max Identity": 1.0,
-            },
-            {
-                "Method": "PRO-LDM (ω=20)",
-                "Target Label": 8,
-                "ESM-2 Score": float(baseline["esm2_fitness"].mean()) if "esm2_fitness" in baseline.columns else float("nan"),
-                "PRO-LDM Score": float(baseline["pldm_regressor_score"].mean()),
-                "Avg. pLDDT": float(baseline["plddt_score"].mean()),
-                "Mean Identity": float(baseline["sequence_identity_wt"].mean()),
-                "Max Identity": float(baseline["sequence_identity_wt"].max()),
-            },
-            {
-                "Method": "ESS (TFG)",
-                "Target Label": "N/A",
-                "ESM-2 Score": float(ess["esm2_fitness"].mean()) if "esm2_fitness" in ess.columns else float("nan"),
-                "PRO-LDM Score": float(ess["pldm_regressor_score"].mean()),
-                "Avg. pLDDT": float(ess["plddt_score"].mean()),
-                "Mean Identity": float(ess["sequence_identity_wt"].mean()),
-                "Max Identity": float(ess["sequence_identity_wt"].max()),
-            },
-            {
-                "Method": "TESS (TFG)",
-                "Target Label": "N/A",
-                "ESM-2 Score": float(tess["esm2_fitness"].mean()) if "esm2_fitness" in tess.columns else float("nan"),
-                "PRO-LDM Score": float(tess["pldm_regressor_score"].mean()),
-                "Avg. pLDDT": float(tess["plddt_score"].mean()),
-                "Mean Identity": float(tess["sequence_identity_wt"].mean()),
-                "Max Identity": float(tess["sequence_identity_wt"].max()),
-            },
-            {
-                "Method": "Transport ESS",
-                "Target Label": "N/A",
-                "ESM-2 Score": float(transport["esm2_fitness"].mean()) if "esm2_fitness" in transport.columns else float("nan"),
-                "PRO-LDM Score": float(transport["pldm_regressor_score"].mean()),
-                "Avg. pLDDT": float(transport["plddt_score"].mean()),
-                "Mean Identity": float(transport["sequence_identity_wt"].mean()),
-                "Max Identity": float(transport["sequence_identity_wt"].max()),
-            },
-        ]
-    )
+    def _safe_mean(df, col):
+        if df is None or col not in df.columns:
+            return float("nan")
+        return float(df[col].mean())
+
+    table_rows = [
+        {
+            "Method": "Natural (WT)",
+            "Target Label": "N/A",
+            "ESM-2 Score": wt_score_val,
+            "PRO-LDM Score": wt_reg,
+            "Avg. pLDDT": wt_plddt,
+            "Mean Identity": 1.0,
+            "Max Identity": 1.0,
+        },
+        {
+            "Method": "PRO-LDM (omega=20)",
+            "Target Label": 8,
+            "ESM-2 Score": _safe_mean(baseline, "esm2_fitness"),
+            "PRO-LDM Score": _safe_mean(baseline, "pldm_regressor_score"),
+            "Avg. pLDDT": _safe_mean(baseline, "plddt_score"),
+            "Mean Identity": _safe_mean(baseline, "sequence_identity_wt"),
+            "Max Identity": float(baseline["sequence_identity_wt"].max()) if "sequence_identity_wt" in baseline.columns else float("nan"),
+        },
+        {
+            "Method": "ESS (TFG)",
+            "Target Label": "N/A",
+            "ESM-2 Score": _safe_mean(ess, "esm2_fitness"),
+            "PRO-LDM Score": _safe_mean(ess, "pldm_regressor_score"),
+            "Avg. pLDDT": _safe_mean(ess, "plddt_score"),
+            "Mean Identity": _safe_mean(ess, "sequence_identity_wt"),
+            "Max Identity": float(ess["sequence_identity_wt"].max()) if "sequence_identity_wt" in ess.columns else float("nan"),
+        },
+        {
+            "Method": "TESS (TFG)",
+            "Target Label": "N/A",
+            "ESM-2 Score": _safe_mean(tess, "esm2_fitness"),
+            "PRO-LDM Score": _safe_mean(tess, "pldm_regressor_score"),
+            "Avg. pLDDT": _safe_mean(tess, "plddt_score"),
+            "Mean Identity": _safe_mean(tess, "sequence_identity_wt"),
+            "Max Identity": float(tess["sequence_identity_wt"].max()) if "sequence_identity_wt" in tess.columns else float("nan"),
+        },
+        {
+            "Method": "Transport ESS",
+            "Target Label": "N/A",
+            "ESM-2 Score": _safe_mean(transport, "esm2_fitness"),
+            "PRO-LDM Score": _safe_mean(transport, "pldm_regressor_score"),
+            "Avg. pLDDT": _safe_mean(transport, "plddt_score"),
+            "Mean Identity": _safe_mean(transport, "sequence_identity_wt"),
+            "Max Identity": float(transport["sequence_identity_wt"].max()) if "sequence_identity_wt" in transport.columns else float("nan"),
+        },
+    ]
+    if ress is not None:
+        table_rows.append({
+            "Method": "RESS",
+            "Target Label": "N/A",
+            "ESM-2 Score": _safe_mean(ress, "esm2_fitness"),
+            "PRO-LDM Score": _safe_mean(ress, "pldm_regressor_score"),
+            "Avg. pLDDT": _safe_mean(ress, "plddt_score"),
+            "Mean Identity": _safe_mean(ress, "sequence_identity_wt"),
+            "Max Identity": float(ress["sequence_identity_wt"].max()) if ress is not None and "sequence_identity_wt" in ress.columns else float("nan"),
+        })
+
+    table = pd.DataFrame(table_rows)
     table.to_csv(results_dir / "table_fitness_fidelity_benchmark.csv", index=False)
     (results_dir / "table_fitness_fidelity_benchmark.md").write_text(dataframe_to_markdown(table), encoding="utf-8")
 
-    # UMAP (default: use all natural points; set --umap-train-samples > 0 to subsample)
+    # UMAP
     if args.umap_train_samples is not None and args.umap_train_samples > 0:
         train_sample = train_df.sample(min(args.umap_train_samples, len(train_df)), random_state=args.seed)
     else:
@@ -523,14 +552,26 @@ def main() -> None:
     z_ess = encode(model, ess["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
     z_tess = encode(model, tess["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
     z_transport = encode(model, transport["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
-    all_z = torch.cat([z_train, z_baseline, z_ess, z_tess, z_transport], dim=0).numpy()
+
+    all_z_parts = [z_train, z_baseline, z_ess, z_tess, z_transport]
+    sources = (
+        ["natural"] * len(z_train)
+        + ["baseline_pldm"] * len(z_baseline)
+        + ["ess"] * len(z_ess)
+        + ["tess"] * len(z_tess)
+        + ["transport_ess"] * len(z_transport)
+    )
+    if ress is not None:
+        z_ress = encode(model, ress["sequence"].tolist(), dims["seq_len"], device, args.batch_size)
+        all_z_parts.append(z_ress)
+        sources += ["ress"] * len(z_ress)
+
+    all_z = torch.cat(all_z_parts, dim=0).numpy()
     emb = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.1, random_state=args.seed).fit_transform(all_z)
-    sources = ["natural"] * len(z_train) + ["baseline_pldm"] * len(z_baseline) + ["ess"] * len(z_ess) + ["tess"] * len(z_tess) + ["transport_ess"] * len(z_transport)
-    
-    # Extract fluorescence values for natural proteins
+
     fit_col = infer_fitness_col(train_sample)
     fitness_vals = train_sample[fit_col].values if fit_col is not None else None
-    
+
     umap_df = pd.DataFrame({"x": emb[:, 0], "y": emb[:, 1], "source": sources})
     umap_df.to_csv(results_dir / "umap_points.csv", index=False)
 
@@ -566,8 +607,8 @@ def main() -> None:
         plt.close()
 
     # KL
-    fit_col = infer_fitness_col(test_df)
-    holdout = test_df.nlargest(100, fit_col) if fit_col is not None else test_df.head(100)
+    fit_col_test = infer_fitness_col(test_df)
+    holdout = test_df.nlargest(100, fit_col_test) if fit_col_test is not None else test_df.head(100)
     hold_dist = aa_distribution([clean_seq(str(s)) for s in holdout[seq_col].tolist()])
     kl_vals = {m: dkl(aa_distribution(df["sequence"].tolist()), hold_dist) for m, df in method_frames.items()}
     plt.figure(figsize=(8, 6))
@@ -597,7 +638,7 @@ def main() -> None:
         plt.savefig(results_dir / "plot_pearson_esm2_vs_pldm.png", dpi=220)
         plt.close()
 
-    # Method-specific plot directories and plot variants
+    # Per-method plot directories
     method_dirs: Dict[str, Path] = {}
     for method_name in METHOD_STYLES:
         method_dir = results_dir / method_name
@@ -605,6 +646,8 @@ def main() -> None:
         method_dirs[method_name] = method_dir
 
     for method_name, (method_label, method_color) in METHOD_STYLES.items():
+        if method_name not in method_frames:
+            continue  # ress may be absent
         method_df = combined[combined["method_name"] == method_name].copy()
         method_dir = method_dirs[method_name]
 
