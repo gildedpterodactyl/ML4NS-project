@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr
 
 from pipeline_utils import (
     ESM2Scorer,
@@ -19,6 +20,7 @@ from pipeline_utils import (
     hamming,
     identity,
     infer_dims_from_state,
+    infer_fitness_col,
     infer_seq_col,
     kabsch_rmsd,
     normalize_ckpt_state,
@@ -67,9 +69,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--structure-max-per-method", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
-    # runtime_sec is written by generate_sequences.py into the input CSV;
-    # if absent the user can supply it here for ESS/sec computation.
     p.add_argument("--runtime-sec", type=float, default=None)
+    # New: LOO calibration sample size (set 0 to skip)
+    p.add_argument("--loo-max-samples", type=int, default=200,
+                   help="Max training sequences used for LOO regressor calibration (0 = skip).")
     return p.parse_args()
 
 
@@ -192,6 +195,190 @@ def pairwise_residue_correlation(train_seqs: List[str], gen_seqs: List[str]) -> 
     if vt.std() < 1e-12 or vg.std() < 1e-12:
         return 0.0
     return float(np.corrcoef(vt, vg)[0, 1])
+
+
+# ---------------------------------------------------------------------------
+# NEW: Per-position KL divergence  D_KL(p_gen || p_train)
+# ---------------------------------------------------------------------------
+
+def positional_aa_freqs(seqs: List[str], L: int, pseudocount: float = 0.5) -> np.ndarray:
+    """
+    Return (L, 20) matrix of amino-acid frequencies at each position.
+    Laplace (add-pseudocount) smoothing avoids zero-probability positions.
+    Only the 20 canonical AAs are counted; gaps/unknowns are ignored.
+    """
+    counts = np.zeros((L, len(_AA_ALPHABET)), dtype=np.float64) + pseudocount
+    for s in seqs:
+        for j, ch in enumerate(s[:L]):
+            idx = _AA_TO_IDX.get(ch, None)
+            if idx is not None:
+                counts[j, idx] += 1.0
+    freqs = counts / counts.sum(axis=1, keepdims=True)
+    return freqs
+
+
+def positional_kl_divergence(
+    train_seqs: List[str],
+    gen_seqs: List[str],
+) -> Tuple[float, np.ndarray]:
+    """
+    Per-position KL divergence D_KL(p_gen || p_train) averaged over positions.
+
+    Returns
+    -------
+    mean_kl   : float  -- scalar summary (lower is better; 0 = identical)
+    per_pos   : (L,) ndarray -- per-position KL values for inspection
+
+    Notes
+    -----
+    Laplace smoothing (pseudocount=0.5) ensures p_train > 0 everywhere so
+    D_KL is always finite.  We use D_KL(gen || train) so that the divergence
+    penalises generated positions that place mass on residues the training
+    set never uses.
+    """
+    if not train_seqs or not gen_seqs:
+        return float("nan"), np.array([])
+
+    L = max(max(len(s) for s in train_seqs), max(len(s) for s in gen_seqs))
+    p_train = positional_aa_freqs(train_seqs, L)   # (L, 20)
+    p_gen   = positional_aa_freqs(gen_seqs,   L)   # (L, 20)
+
+    # D_KL(p_gen || p_train) = sum_a p_gen(a) * log(p_gen(a) / p_train(a))
+    ratio     = np.log(p_gen / p_train)             # (L, 20)
+    kl_per_pos = (p_gen * ratio).sum(axis=1)        # (L,)
+    mean_kl   = float(np.mean(kl_per_pos))
+    return mean_kl, kl_per_pos
+
+
+# ---------------------------------------------------------------------------
+# NEW: LOO regressor calibration
+# ---------------------------------------------------------------------------
+
+def loo_regressor_calibration(
+    model,
+    train_df: pd.DataFrame,
+    seq_col: str,
+    fitness_col: Optional[str],
+    seq_len: int,
+    device: torch.device,
+    max_samples: int = 200,
+) -> Dict[str, float]:
+    """
+    Leave-One-Out calibration of the PLDM regressor on the training set.
+
+    For each held-out sequence i, the regressor predicts its fitness using
+    only the *loaded* (already-trained) model weights -- we do NOT retrain.
+    This is therefore a *retrospective* LOO check: it measures whether the
+    regressor's predictions on individual training sequences correlate with
+    ground-truth fitness labels, which calibrates how much we should trust
+    its scores on novel generated sequences.
+
+    Returns a dict with keys:
+        loo_spearman_rho   : Spearman rank correlation (pred vs truth)
+        loo_mse            : Mean squared error
+        loo_mae            : Mean absolute error
+        loo_n              : number of sequences evaluated
+
+    If no ground-truth fitness column is found, all values are NaN.
+    """
+    empty = {"loo_spearman_rho": float("nan"),
+             "loo_mse":          float("nan"),
+             "loo_mae":          float("nan"),
+             "loo_n":            0}
+
+    if fitness_col is None or fitness_col not in train_df.columns:
+        return empty
+    if max_samples <= 0:
+        return empty
+
+    sub = train_df[[seq_col, fitness_col]].dropna().reset_index(drop=True)
+    if len(sub) == 0:
+        return empty
+
+    # Subsample if large
+    if len(sub) > max_samples:
+        sub = sub.sample(n=max_samples, random_state=0).reset_index(drop=True)
+
+    seqs   = [clean_seq(str(s)) for s in sub[seq_col].tolist()]
+    truths = sub[fitness_col].to_numpy(dtype=np.float64)
+
+    # Encode all at once and score with the frozen regressor
+    z_all = encode(model, seqs, seq_len, device, batch_size=64).to(device)
+    with torch.no_grad():
+        preds = model.regressor_module(z_all).squeeze(-1).detach().cpu().numpy()
+
+    valid = np.isfinite(preds) & np.isfinite(truths)
+    if valid.sum() < 4:
+        return empty
+
+    rho, _ = spearmanr(preds[valid], truths[valid])
+    mse    = float(np.mean((preds[valid] - truths[valid]) ** 2))
+    mae    = float(np.mean(np.abs(preds[valid] - truths[valid])))
+
+    return {
+        "loo_spearman_rho": float(rho),
+        "loo_mse":          mse,
+        "loo_mae":          mae,
+        "loo_n":            int(valid.sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# NEW: Spearman rho between regressor scores and true DMS brightness
+# ---------------------------------------------------------------------------
+
+def spearman_regressor_vs_truth(
+    gen_seqs:      List[str],
+    gen_scores:    np.ndarray,
+    train_df:      pd.DataFrame,
+    seq_col:       str,
+    fitness_col:   Optional[str],
+    identity_threshold: float = 0.95,
+) -> Dict[str, float]:
+    """
+    Compute Spearman rho between the PLDM regressor scores for generated
+    sequences and the ground-truth DMS fitness values for those same
+    sequences (matched by sequence identity >= identity_threshold).
+
+    This answers: "When a generated sequence closely matches a known training
+    sequence, does the regressor rank them correctly?"
+
+    Returns
+    -------
+    dict with keys:
+        spearman_rho_vs_truth  : float
+        n_matched              : int  -- how many gen seqs matched a training seq
+    """
+    empty = {"spearman_rho_vs_truth": float("nan"), "n_matched": 0}
+
+    if fitness_col is None or fitness_col not in train_df.columns:
+        return empty
+
+    train_seqs_all    = [clean_seq(str(s)) for s in train_df[seq_col].dropna().tolist()]
+    train_fitness_all = train_df[fitness_col].dropna().to_numpy(dtype=np.float64)
+
+    if len(train_seqs_all) != len(train_fitness_all):
+        # align by index after dropna
+        tmp = train_df[[seq_col, fitness_col]].dropna().reset_index(drop=True)
+        train_seqs_all    = [clean_seq(str(s)) for s in tmp[seq_col].tolist()]
+        train_fitness_all = tmp[fitness_col].to_numpy(dtype=np.float64)
+
+    matched_pred, matched_truth = [], []
+    for seq, score in zip(gen_seqs, gen_scores):
+        for t_seq, t_fit in zip(train_seqs_all, train_fitness_all):
+            if identity(seq, t_seq) >= identity_threshold:
+                matched_pred.append(score)
+                matched_truth.append(t_fit)
+                break  # take the first match per generated sequence
+
+    if len(matched_pred) < 4:
+        return {"spearman_rho_vs_truth": float("nan"), "n_matched": len(matched_pred)}
+
+    rho, _ = spearmanr(matched_pred, matched_truth)
+    return {
+        "spearman_rho_vs_truth": float(rho),
+        "n_matched":             len(matched_pred),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +532,7 @@ def main() -> None:
     train_df  = pd.read_csv(train_csv)
     wt_seq    = choose_wt(train_df)
     train_seq_col = infer_seq_col(train_df)
+    train_fitness_col = infer_fitness_col(train_df)
     train_seqs = [clean_seq(str(s)) for s in train_df[train_seq_col].dropna().tolist()]
 
     sys.path.insert(0, str(proldm_root))
@@ -421,7 +609,33 @@ def main() -> None:
     out.to_csv(results_csv, index=False)
     print(f"Saved per-sequence results to: {results_csv}")
 
-    # 5. Set-level summary
+    # ------------------------------------------------------------------
+    # 5. NEW -- Per-position KL divergence  D_KL(p_gen || p_train)
+    # ------------------------------------------------------------------
+    mean_kl, kl_per_pos = positional_kl_divergence(train_seqs, seqs)
+
+    # Save per-position KL array as a companion file for inspection/plotting
+    if len(kl_per_pos) > 0:
+        kl_path = results_csv.with_suffix(".kl_per_pos.npy")
+        np.save(kl_path, kl_per_pos)
+        print(f"Saved per-position KL divergence array to: {kl_path}")
+
+    # ------------------------------------------------------------------
+    # 6. NEW -- LOO regressor calibration on training set
+    # ------------------------------------------------------------------
+    loo_metrics = loo_regressor_calibration(
+        model, train_df, train_seq_col, train_fitness_col,
+        dims["seq_len"], device, max_samples=args.loo_max_samples,
+    )
+
+    # ------------------------------------------------------------------
+    # 7. NEW -- Spearman rho between regressor scores and true DMS labels
+    # ------------------------------------------------------------------
+    spearman_metrics = spearman_regressor_vs_truth(
+        seqs, pldm_score, train_df, train_seq_col, train_fitness_col,
+    )
+
+    # 8. Set-level summary
     summary: Dict = {
         "method_name":                           args.method_name,
         "n_sequences":                           len(seqs),
@@ -432,6 +646,15 @@ def main() -> None:
         "mean_identity_wt":                      float(np.nanmean(out["sequence_identity_wt"])),
         "entropy_mse_vs_train":                  entropy_mse(train_seqs, seqs),
         "pairwise_residue_correlation_vs_train": pairwise_residue_correlation(train_seqs, seqs),
+        # NEW
+        "mean_positional_kl_divergence":         mean_kl,
+        "loo_spearman_rho":                      loo_metrics["loo_spearman_rho"],
+        "loo_mse":                               loo_metrics["loo_mse"],
+        "loo_mae":                               loo_metrics["loo_mae"],
+        "loo_n":                                 loo_metrics["loo_n"],
+        "spearman_rho_vs_truth":                 spearman_metrics["spearman_rho_vs_truth"],
+        "n_matched_to_truth":                    spearman_metrics["n_matched"],
+        # existing
         "mean_plddt_score":                      float(np.nanmean(out["plddt_score"])),
         "mean_rmsd":                             float(np.nanmean(out["rmsd"])),
     }
@@ -451,6 +674,10 @@ def main() -> None:
     print(f"  Min Hamming to train      : {summary['mean_min_hamming_to_train']:.1f}")
     print(f"  Entropy MSE vs train      : {summary['entropy_mse_vs_train']:.6f}")
     print(f"  Pairwise residue corr     : {summary['pairwise_residue_correlation_vs_train']:.4f}")
+    print(f"  Mean pos. KL div (gen||tr): {summary['mean_positional_kl_divergence']:.6f}")
+    print(f"  LOO Spearman rho          : {summary['loo_spearman_rho']:.4f}  (n={summary['loo_n']})")
+    print(f"  LOO MSE / MAE             : {summary['loo_mse']:.4f} / {summary['loo_mae']:.4f}")
+    print(f"  Spearman rho vs DMS truth : {summary['spearman_rho_vs_truth']:.4f}  (n_matched={summary['n_matched_to_truth']})")
     print(f"  Mean pLDDT                : {summary['mean_plddt_score']:.2f}")
     print(f"  Mean RMSD                 : {summary['mean_rmsd']:.2f}")
     print(f"  Worst-chain IACT          : {summary['iact']:.2f}")
