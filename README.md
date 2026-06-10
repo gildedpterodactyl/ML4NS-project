@@ -1,4 +1,4 @@
-# ProtSteer — ML for Neuroscience / Protein Steering via MCMC Sampling
+# ProtSteer — ML for De Novo Protein Sequence Generation via MCMC Sampling
 
 > **Steering protein sequence design using advanced Markov Chain Monte Carlo algorithms grounded in Elliptical Slice Sampling, Truncated ESS, and Transport ESS.**
 
